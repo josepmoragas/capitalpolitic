@@ -1,0 +1,1556 @@
+<!DOCTYPE html>
+<html lang="ca">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Capital Polític — simulador d'eleccions</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.10/babel.min.js"></script>
+<style>html,body{margin:0;padding:0;height:100%;background:#ddd2b6;}#root{height:100%;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useEffect, useRef } = React;
+
+
+/* ==========================================================================
+   CAPITAL POLÍTIC — simulador polític català
+   Un sol fitxer. Disseny vintage clar (almanac electoral d'impremta antiga).
+   ========================================================================== */
+
+/* ----------------------------- Dades base -------------------------------- */
+
+const IDEOS = [
+  "NACIONALISME", "SOCIALISME", "INDEPENDENTISME", "CAPITALISME", "LIBERALISME",
+  "ANTI-IMMIGRACIÓ", "ECOLOGISME", "ECONOMIA", "AUTORITARISME", "MITJANS",
+];
+
+// ordre: NAC, SOC, IND, CAP, LIB, ANTI, ECO, ECON, AUT, MIT
+const BASE_PARTIES = [
+  { key: "JUNTS",   name: "Junts+",       color: "#00A79C", vote: 17, ideo: [9,3,8,7,6,5,4,6,4,6] },
+  { key: "ERC",     name: "ERC",          color: "#E89A00", vote: 13, ideo: [8,7,9,3,6,2,7,4,3,5] },
+  { key: "PSC",     name: "PSC",          color: "#D22630", vote: 30, ideo: [3,7,1,5,6,3,6,5,3,5] },
+  { key: "VOX",     name: "Vox",          color: "#5BAF2A", vote: 9,  ideo: [0,1,0,8,3,10,1,7,9,6] },
+  { key: "PP",      name: "PP",           color: "#0A6FBE", vote: 8,  ideo: [1,2,0,8,5,6,3,7,6,6] },
+  { key: "CUP",     name: "CUP",          color: "#EBC61C", vote: 5,  ideo: [7,10,10,0,5,0,9,2,2,4] },
+  { key: "COMUNS",  name: "Comuns",       color: "#8E44AD", vote: 4,  ideo: [2,8,4,2,7,1,10,3,2,5] },
+  { key: "ALIANCA", name: "Aliança.cat",  color: "#17457D", vote: 7,  ideo: [10,3,9,6,2,10,3,6,8,4] },
+];
+
+const PROVINCES = [
+  { key: "BCN", name: "Barcelona", seats: 85 },
+  { key: "GIR", name: "Girona",    seats: 17 },
+  { key: "LLE", name: "Lleida",    seats: 15 },
+  { key: "TAR", name: "Tarragona", seats: 18 },
+];
+const MAJORIA = 68;
+
+// Multiplicadors de força per província (força territorial)
+const LEANS = {
+  JUNTS:   { BCN: 0.82, GIR: 1.70, LLE: 1.60, TAR: 0.95 },
+  ERC:     { BCN: 0.95, GIR: 1.15, LLE: 1.25, TAR: 1.00 },
+  PSC:     { BCN: 1.12, GIR: 0.72, LLE: 0.80, TAR: 1.08 },
+  VOX:     { BCN: 0.95, GIR: 1.00, LLE: 1.05, TAR: 1.20 },
+  PP:      { BCN: 0.95, GIR: 0.85, LLE: 0.95, TAR: 1.15 },
+  CUP:     { BCN: 1.00, GIR: 1.10, LLE: 0.95, TAR: 1.00 },
+  COMUNS:  { BCN: 1.35, GIR: 0.55, LLE: 0.45, TAR: 0.80 },
+  ALIANCA: { BCN: 0.60, GIR: 1.70, LLE: 1.40, TAR: 0.80 },
+  PLAYER:  { BCN: 1.00, GIR: 1.00, LLE: 1.00, TAR: 1.00 },
+};
+
+const PLAYER_COLORS = ["#6E8B3D", "#B5651D", "#8E4585", "#2E7D74", "#9E4A3C", "#4A5D8A"];
+
+/* ------------------------------ Utilitats -------------------------------- */
+
+const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const rnd = (a, b) => a + Math.random() * (b - a);
+const round1 = (x) => Math.round(x * 10) / 10;
+function gauss(mean = 0, sd = 1) {
+  let u = 0, v = 0;
+  while (u === 0) u = Math.random();
+  while (v === 0) v = Math.random();
+  return mean + sd * Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+const avgDist = (a, b) => a.reduce((s, x, i) => s + Math.abs(x - b[i]), 0) / a.length;
+
+// Pes de cada eix en les RELACIONS entre partits (alguns eixos separen molt més).
+// ordre: NAC, SOC, IND, CAP, LIB, ANTI, ECO, ECON, AUT, MIT
+const WEIGHTS = [1.8, 1.3, 1.9, 1.0, 0.8, 1.9, 0.7, 0.9, 1.1, 0.5];
+const WSUM = WEIGHTS.reduce((s, w) => s + w, 0);
+// distància ideològica ponderada (0..10)
+const wdist = (a, b) => a.reduce((s, x, i) => s + WEIGHTS[i] * Math.abs(x - b[i]), 0) / WSUM;
+
+// relació 0..100 a partir de la distància ponderada
+function relationScore(a, b) {
+  return clamp(Math.round(100 - wdist(a, b) * 19), 0, 100);
+}
+function relationLabel(score) {
+  if (score >= 70) return { t: "Aliat", c: "#3f7a4f" };
+  if (score >= 48) return { t: "Cordial", c: "#6b8b3f" };
+  if (score >= 28) return { t: "Tens", c: "#c08a2e" };
+  return { t: "Hostil", c: "#b23a2e" };
+}
+
+function normalizeVotes(parties) {
+  const t = parties.reduce((s, p) => s + p.vote, 0) || 1;
+  parties.forEach((p) => (p.vote = (p.vote / t) * 100));
+}
+
+function dhondt(shares, seats, threshold = 3) {
+  let entries = Object.entries(shares).filter(([, v]) => v >= threshold);
+  if (entries.length === 0) entries = Object.entries(shares);
+  const q = [];
+  for (const [k, v] of entries) for (let s = 1; s <= seats; s++) q.push({ k, val: v / s });
+  q.sort((a, b) => b.val - a.val);
+  const out = {};
+  Object.keys(shares).forEach((k) => (out[k] = 0));
+  for (let i = 0; i < seats; i++) out[q[i].k]++;
+  return out;
+}
+
+function computeElection(parties) {
+  const catalonia = {};
+  parties.forEach((p) => (catalonia[p.key] = 0));
+  const provinces = {};
+  for (const pv of PROVINCES) {
+    const shares = {};
+    parties.forEach((p) => {
+      const lean = (LEANS[p.leanKey] || LEANS.PLAYER)[pv.key] || 1;
+      shares[p.key] = p.vote * lean;
+    });
+    const t = Object.values(shares).reduce((s, v) => s + v, 0) || 1;
+    Object.keys(shares).forEach((k) => (shares[k] = (shares[k] / t) * 100));
+    const seats = dhondt(shares, pv.seats, 3);
+    provinces[pv.key] = seats;
+    Object.keys(seats).forEach((k) => (catalonia[k] += seats[k]));
+  }
+  let winner = parties[0].key, best = -1;
+  parties.forEach((p) => {
+    const s = catalonia[p.key];
+    if (s > best || (s === best && p.vote > (parties.find((x) => x.key === winner)?.vote ?? 0))) {
+      best = s; winner = p.key;
+    }
+  });
+  return { catalonia, provinces, winner };
+}
+
+// Sensibilitat d'un eix segons com de contundent és la posició ratificada.
+// Valors alts = eixos "bandera": moure'ls (amunt o avall) costa molta més aprovació.
+const axisWeight = (val) => 0.15 + Math.pow(val / 10, 1.5) * 0.85;
+function ideoPenalty(ideo, approvedIdeo) {
+  let pen = 0;
+  for (let i = 0; i < ideo.length; i++) pen += axisWeight(approvedIdeo[i]) * Math.abs(ideo[i] - approvedIdeo[i]);
+  return pen;
+}
+function calcApproval(ideo, approvedIdeo, playerVote, baselineVote, noise = 0) {
+  const v = 92 - ideoPenalty(ideo, approvedIdeo) * 7.5 + (playerVote - baselineVote) * 0.5 + noise;
+  return clamp(Math.round(v), 0, 100);
+}
+
+/* --------------------------- Estat inicial -------------------------------- */
+
+function makeGame(mode, name, color, ideo, existingKey, startVote) {
+  let parties;
+  if (mode === "custom") {
+    parties = [
+      { key: "PLAYER", leanKey: "PLAYER", name: name || "El meu partit", color, vote: startVote ?? 7, ideo: [...ideo], isPlayer: true },
+      ...BASE_PARTIES.map((p) => ({ ...p, leanKey: p.key, ideo: [...p.ideo] })),
+    ];
+  } else {
+    const x = BASE_PARTIES.find((p) => p.key === existingKey);
+    parties = [
+      { key: "PLAYER", leanKey: x.key, name: x.name + " (tu)", color: x.color, vote: x.vote, ideo: [...x.ideo], isPlayer: true },
+      ...BASE_PARTIES.filter((p) => p.key !== existingKey).map((p) => ({ ...p, leanKey: p.key, ideo: [...p.ideo] })),
+    ];
+  }
+  normalizeVotes(parties);
+  parties.forEach((p) => (p.base = p.vote)); // base d'oscil·lació = resultat de les últimes eleccions (a l'inici, el vot de partida)
+  const player = parties.find((p) => p.isPlayer);
+  const approvedIdeo = [...player.ideo];
+  const baselineVote = player.vote;
+  const momentum = Array.from({ length: 10 }, () => round1(rnd(0, 10)));
+  const seats0 = computeElection(parties).catalonia;
+  const poll0 = parties.map((p) => ({ key: p.key, vote: p.vote, delta: 0, seats: seats0[p.key], seatDelta: 0 }));
+  return {
+    turn: 0,
+    cp: 10,
+    parties,
+    momentum,
+    approvedIdeo,
+    baselineVote,
+    approval: calcApproval(player.ideo, approvedIdeo, player.vote, baselineVote),
+    congressCooldown: 6,
+    congressPending: false,
+    nextElectionAt: 5,
+    lastElection: null,
+    poll: poll0,
+    pollHistory: [{ turn: 0, votes: kv(parties, "vote"), seats: { ...seats0 } }],
+    electionHistory: [],
+    pais: { pib: 2.1, inflacio: 3.0, atur: 9.5, benestar: 60 },
+    electionsWon: 0,
+    presidencies: 0,
+    president: null,
+  };
+}
+
+// helper: {key: value} d'un camp dels partits
+function kv(parties, field) {
+  const o = {};
+  parties.forEach((p) => (o[p.key] = p[field]));
+  return o;
+}
+
+const player = (g) => g.parties.find((p) => p.isPlayer);
+const byKey = (g, k) => g.parties.find((p) => p.key === k);
+
+/* ============================== COMPONENT ================================= */
+
+function App() {
+  const [screen, setScreen] = useState("setup");
+  const [tab, setTab] = useState("partit");
+  const [overlay, setOverlay] = useState(null);
+  const [g, setG] = useState(null);
+  const [election, setElection] = useState(null);
+  const [inv, setInv] = useState(null);
+  const [congress, setCongress] = useState(null);
+  const [gameover, setGameover] = useState(null);
+  const [turnSummary, setTurnSummary] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [rules, setRules] = useState(false);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = setTimeout(() => setToast(null), 2600);
+    return () => clearTimeout(t);
+  }, [toast]);
+
+  /* ----------------------------- SETUP ---------------------------------- */
+  const [mode, setMode] = useState("custom");
+  const [pname, setPname] = useState("");
+  const [pcolor, setPcolor] = useState(PLAYER_COLORS[0]);
+  const [pideo, setPideo] = useState([5, 5, 5, 5, 5, 5, 5, 5, 5, 5]);
+  const [pvoteStart, setPvoteStart] = useState(3);
+  const [existing, setExisting] = useState(null);
+
+  function start() {
+    if (mode === "existing" && !existing) return;
+    const ng = makeGame(mode, pname, pcolor, pideo, existing, pvoteStart);
+    setG(ng);
+    setScreen("game");
+    setTab("partit");
+  }
+
+  /* ------------------------- Ajust d'ideologia -------------------------- */
+  function adjustIdeo(i, dir) {
+    setG((prev) => {
+      if (prev.cp < 1) return prev;
+      const p = player(prev);
+      const nv = clamp(p.ideo[i] + dir, 0, 10);
+      if (nv === p.ideo[i]) return prev;
+      const parties = prev.parties.map((pt) =>
+        pt.isPlayer ? { ...pt, ideo: pt.ideo.map((x, j) => (j === i ? nv : x)) } : pt
+      );
+      const np = parties.find((x) => x.isPlayer);
+      return {
+        ...prev,
+        parties,
+        cp: prev.cp - 1,
+        approval: calcApproval(np.ideo, prev.approvedIdeo, np.vote, prev.baselineVote),
+      };
+    });
+  }
+
+  /* ------------------------------ Congrés ------------------------------- */
+  function convokeCongress() {
+    setG((prev) => (prev.congressCooldown > 0 || prev.congressPending ? prev
+      : { ...prev, congressPending: true, congressCooldown: 6 }));
+    setToast("Congrés convocat · es resol el proper torn");
+  }
+
+  /* ---------------------------- Passar torn ----------------------------- */
+  function passTurn() {
+    if (overlay || !g) return;
+    const prev = g;
+    const t = prev.turn + 1;
+
+    // 1) MOMENTUM va derivant
+    const momentum = prev.momentum.map((m) => {
+      const step = rnd(0.1, 1.0) * (Math.random() < 0.5 ? -1 : 1);
+      return round1(clamp(m + step, 0, 10));
+    });
+
+    // 2) Enquesta: oscil·la SEMPRE al voltant del resultat de les últimes eleccions (p.base),
+    //    no acumulant sobre l'enquesta anterior. El momentum inclina qui puja o baixa respecte la base.
+    const prox = prev.parties.map((p) => 10 - avgDist(p.ideo, momentum));
+    const field = prox.reduce((s, x) => s + x, 0) / prox.length;
+    const prevVotes = {};
+    prev.parties.forEach((p) => (prevVotes[p.key] = p.vote));
+    let parties = prev.parties.map((p, i) => {
+      const target = Math.max(0.5, p.base + 1.8 * (prox[i] - field)); // objectiu = base ± inclinació pel momentum
+      let d = (target - p.vote) * 0.6 + gauss(0, 1.0);                // s'hi acosta suau + soroll
+      d = clamp(d, -4, 4);                                            // moviment màxim ~4 punts per torn
+      return { ...p, vote: Math.max(0.5, p.vote + d) };
+    });
+    normalizeVotes(parties);
+    const prevSeats = {};
+    prev.poll.forEach((r) => (prevSeats[r.key] = r.seats));
+    const projSeats = computeElection(parties).catalonia;
+    const poll = parties.map((p) => ({
+      key: p.key, vote: p.vote, delta: p.vote - prevVotes[p.key],
+      seats: projSeats[p.key], seatDelta: projSeats[p.key] - (prevSeats[p.key] ?? 0),
+    }));
+    const pollHistory = [...prev.pollHistory, { turn: t, votes: kv(parties, "vote"), seats: { ...projSeats } }].slice(-80);
+
+    // 3) Aprovació del líder
+    const np = parties.find((p) => p.isPlayer);
+    const approval = calcApproval(np.ideo, prev.approvedIdeo, np.vote, prev.baselineVote, gauss(0, 3));
+
+    // 4) Indicadors de país (bàsic, v1)
+    const gov = prev.president ? byKey(prev, prev.president) : null;
+    const govEcon = gov ? gov.ideo[7] : 5;
+    const pais = {
+      pib: round1(clamp(prev.pais.pib + gauss(0, 0.35) + (govEcon - 5) * 0.03, -4, 6)),
+      inflacio: round1(clamp(prev.pais.inflacio + gauss(0, 0.25), 0, 12)),
+      atur: round1(clamp(prev.pais.atur + gauss(0, 0.3) - (prev.pais.pib - 2) * 0.1, 3, 26)),
+      benestar: Math.round(clamp(prev.pais.benestar + gauss(0, 1.6) + (prev.pais.pib - 2) * 0.6 - (prev.pais.inflacio - 3) * 0.5, 0, 100)),
+    };
+
+    const congressCooldown = Math.max(0, prev.congressCooldown - 1);
+    let next = { ...prev, turn: t, momentum, parties, poll, pollHistory, approval, pais, congressCooldown };
+
+    // 5) Bases abandonen el líder
+    if (approval <= 0) {
+      setG(next);
+      setGameover({ reason: "Les bases han abandonat el lideratge. L'aprovació ha caigut a zero.", g: next });
+      setOverlay("gameover");
+      return;
+    }
+
+    // 6) Esdeveniments: congrés programat i/o eleccions
+    const isElection = t >= prev.nextElectionAt;
+
+    if (prev.congressPending) {
+      next.congressPending = false;
+      resolveCongress(next, isElection); // muta next + obre overlay
+      setG(next);
+      return;
+    }
+    if (isElection) {
+      startElection(next); // muta next + obre overlay
+      setG(next);
+      return;
+    }
+
+    // torn normal → finestra de resum (variació de vot i diputats)
+    setG(next);
+    setTurnSummary({ turn: t, poll: [...poll].sort((a, b) => b.vote - a.vote), parties: next.parties });
+    setOverlay("turnsummary");
+  }
+
+  /* ------------------------------ Congrés (resolució) ------------------- */
+  function resolveCongress(next, chainElection) {
+    const support = clamp(next.approval + gauss(0, 10), 0, 100);
+    const pass = support >= 45;
+    if (pass) {
+      const np = player(next);
+      next.approvedIdeo = [...np.ideo];
+      next.baselineVote = np.vote;
+      next.approval = clamp(Math.round(70 + (support - 45) * 0.3), 0, 100);
+    }
+    setCongress({ pass, support: Math.round(support), chainElection });
+    setOverlay("congress");
+    if (!pass) setGameover({ reason: "El congrés del partit ha rebutjat el nou rumb ideològic. Les bases et destitueixen.", g: next });
+  }
+
+  function closeCongress() {
+    if (!congress) return;
+    if (!congress.pass) { setOverlay("gameover"); setCongress(null); return; }
+    if (congress.chainElection) {
+      const next = { ...g };
+      startElection(next); // muta next + obre overlay 'election'
+      setG(next);
+    } else {
+      setOverlay(null);
+    }
+    setCongress(null);
+  }
+
+  /* ----------------------------- Eleccions ------------------------------ */
+  function startElection(next) {
+    const res = computeElection(next.parties);
+    const prevEl = next.electionHistory.length ? next.electionHistory[next.electionHistory.length - 1].catalonia : null;
+    const deltas = {};
+    next.parties.forEach((p) => { deltas[p.key] = prevEl ? res.catalonia[p.key] - (prevEl[p.key] ?? 0) : null; });
+    const playerSeats = res.catalonia.PLAYER;
+    const won = res.winner === "PLAYER";
+
+    next.cp += playerSeats;
+    next.lastElection = res;
+    next.nextElectionAt = next.turn + 5; // la propera elecció, sempre 5 torns després d'aquesta
+    // la base d'oscil·lació de les enquestes passa a ser el vot d'aquestes eleccions
+    next.parties = next.parties.map((p) => ({ ...p, base: p.vote }));
+    next.electionHistory = [...next.electionHistory, { turn: next.turn, catalonia: { ...res.catalonia } }];
+    if (won) {
+      next.electionsWon += 1;
+      next.momentum = Array.from({ length: 10 }, () => round1(rnd(0, 10))); // reset momentum
+    }
+    // Només el 1r i el 2n partit més votat poden ser candidats a la investidura
+    const order = [...next.parties]
+      .sort((a, b) => res.catalonia[b.key] - res.catalonia[a.key] || b.vote - a.vote)
+      .slice(0, 2)
+      .map((p) => p.key);
+    setElection({ res, playerSeats, won, order, deltas, prevExists: !!prevEl });
+    setOverlay("election");
+  }
+
+  function goInvestiture() {
+    setInv({ order: election.order, idx: 0, playerVote: null, phase: "choose", result: null });
+    setOverlay("investiture");
+  }
+
+  function resolveCandidate(gg, candKey, playerVote) {
+    const cand = byKey(gg, candKey);
+    const votes = gg.parties.map((p) => {
+      const seats = gg.lastElection.catalonia[p.key];
+      if (p.key === candKey) return { key: p.key, vote: "SÍ", seats };
+      if (p.isPlayer) return { key: p.key, vote: playerVote, seats };
+      const d = wdist(p.ideo, cand.ideo) + gauss(0, 0.35);
+      // l'abstenció és difícil: només SÍ si molt a prop, ABS en una franja intermèdia
+      const vote = d < 1.7 ? "SÍ" : d < 3.0 ? "ABS" : "NO";
+      return { key: p.key, vote, seats };
+    });
+    const siSeats = votes.filter((v) => v.vote === "SÍ").reduce((s, v) => s + v.seats, 0);
+    const noSeats = votes.filter((v) => v.vote === "NO").reduce((s, v) => s + v.seats, 0);
+    const absSeats = votes.filter((v) => v.vote === "ABS").reduce((s, v) => s + v.seats, 0);
+    const round1Pass = siSeats >= MAJORIA;        // 1a volta: majoria absoluta (68)
+    const round2Pass = siSeats > noSeats;         // 2a volta: majoria simple (abstencions no bloquegen)
+    const pass = round1Pass || round2Pass;
+    const investedRound = round1Pass ? 1 : round2Pass ? 2 : null;
+    return { votes, siSeats, noSeats, absSeats, round1Pass, round2Pass, pass, investedRound, candKey };
+  }
+
+  function castInvestiture(playerVote) {
+    const candKey = inv.order[inv.idx];
+    const result = resolveCandidate(g, candKey, playerVote);
+    // Efectes sobre el jugador
+    setG((prev) => {
+      let parties = prev.parties.map((p) => ({ ...p }));
+      let cp = prev.cp;
+      let approval = prev.approval;
+      let president = prev.president;
+      let presidencies = prev.presidencies;
+      const cand = parties.find((p) => p.key === candKey);
+      const me = parties.find((p) => p.isPlayer);
+
+      if (result.pass) {
+        president = candKey;
+        if (candKey === "PLAYER") { cp += 5; approval = clamp(approval + 8, 0, 100); presidencies += 1; }
+        else if (playerVote === "SÍ") {
+          cp += 2;
+          const d = wdist(me.ideo, cand.ideo);
+          if (d > 3) { me.vote = Math.max(0.3, me.vote - (d - 3) * 1.1); normalizeVotes(parties); approval = clamp(approval - Math.round((d - 3) * 4), 0, 100); }
+        }
+      }
+      return { ...prev, parties, cp, approval, president, presidencies };
+    });
+    setInv({ ...inv, playerVote, phase: "r1", result });
+  }
+
+  function toRound2() {
+    setInv((prev) => ({ ...prev, phase: "r2" }));
+  }
+
+  function autoInvestiturePlayerCandidate() {
+    const candKey = inv.order[inv.idx];
+    const result = resolveCandidate(g, candKey, "SÍ");
+    setG((prev) => {
+      if (!result.pass) return prev;
+      return { ...prev, president: candKey, cp: prev.cp + 5, approval: clamp(prev.approval + 8, 0, 100), presidencies: prev.presidencies + 1 };
+    });
+    setInv({ ...inv, phase: "r1", result });
+  }
+
+  function nextInvestitureStep() {
+    if (inv.result && inv.result.pass) { setOverlay(null); setInv(null); return; }
+    // fracàs → següent candidat (només n'hi ha dos com a màxim)
+    if (inv.idx + 1 < inv.order.length) {
+      setInv({ order: inv.order, idx: inv.idx + 1, playerVote: null, phase: "choose", result: null });
+    } else {
+      // cap candidat investit → repetició electoral en 2 torns
+      setG((prev) => ({ ...prev, nextElectionAt: prev.turn + 2, president: null }));
+      setOverlay(null); setInv(null);
+      setToast("Cap candidat investit · repetició electoral en 2 torns");
+    }
+  }
+
+  function restart() {
+    setScreen("setup"); setOverlay(null); setG(null);
+    setElection(null); setInv(null); setCongress(null); setGameover(null); setTurnSummary(null);
+    setMode("custom"); setPname(""); setPcolor(PLAYER_COLORS[0]);
+    setPideo([5,5,5,5,5,5,5,5,5,5]); setExisting(null); setTab("partit"); setPvoteStart(3);
+  }
+
+  /* ============================== RENDER ================================= */
+  return (
+    <div className="cp-root">
+      <style>{CSS}</style>
+      <div className="phone">
+        {screen === "setup" ? (
+          <Setup {...{ mode, setMode, pname, setPname, pcolor, setPcolor, pideo, setPideo, pvoteStart, setPvoteStart, existing, setExisting, start, rules, setRules }} />
+        ) : (
+          <Game
+            {...{ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, overlay, rules, setRules }}
+          />
+        )}
+
+        {/* OVERLAYS */}
+        {overlay === "election" && election && (
+          <ElectionOverlay g={g} election={election} onContinue={goInvestiture} />
+        )}
+        {overlay === "investiture" && inv && (
+          <InvestitureOverlay g={g} inv={inv} onCast={castInvestiture} onAuto={autoInvestiturePlayerCandidate} onRound2={toRound2} onNext={nextInvestitureStep} />
+        )}
+        {overlay === "turnsummary" && turnSummary && (
+          <TurnSummaryOverlay g={g} ts={turnSummary} onClose={() => { setOverlay(null); setTurnSummary(null); }} />
+        )}
+        {overlay === "congress" && congress && (
+          <CongressOverlay congress={congress} onClose={closeCongress} />
+        )}
+        {overlay === "gameover" && gameover && (
+          <GameOverOverlay gameover={gameover} onRestart={restart} />
+        )}
+
+        {toast && <div className="toast">{toast}</div>}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------- SETUP ----------------------------------- */
+
+function Setup({ mode, setMode, pname, setPname, pcolor, setPcolor, pideo, setPideo, pvoteStart, setPvoteStart, existing, setExisting, start, rules, setRules }) {
+  const canStart = mode === "custom" ? true : !!existing;
+  const ex = existing ? BASE_PARTIES.find((p) => p.key === existing) : null;
+  return (
+    <div className="content setup">
+      <div className="masthead">
+        <div className="masthead-rule" />
+        <div className="masthead-title">CAPITAL POLÍTIC</div>
+        <div className="masthead-sub">simulador d'eleccions · edició catalana</div>
+        <div className="masthead-rule" />
+      </div>
+
+      <div className="modeswitch">
+        <button className={"mode " + (mode === "custom" ? "on" : "")} onClick={() => setMode("custom")}>Funda un partit</button>
+        <button className={"mode " + (mode === "existing" ? "on" : "")} onClick={() => setMode("existing")}>Agafa'n un</button>
+      </div>
+
+      {mode === "custom" ? (
+        <>
+          <label className="fld-label">Nom del partit</label>
+          <input className="text-in" value={pname} onChange={(e) => setPname(e.target.value)} placeholder="El meu partit" maxLength={22} />
+          <label className="fld-label">Color</label>
+          <div className="swatches">
+            {PLAYER_COLORS.map((c) => (
+              <button key={c} className={"swatch " + (pcolor === c ? "on" : "")} style={{ background: c }} onClick={() => setPcolor(c)} />
+            ))}
+          </div>
+          <label className="fld-label">Intenció de vot inicial <span className="hint-inline">({pvoteStart.toFixed(1)}% — com més baix, més difícil començar)</span></label>
+          <div className="votestart">
+            <input type="range" min={0} max={7} step={0.5} value={pvoteStart}
+              onChange={(e) => setPvoteStart(+e.target.value)} style={{ accentColor: pcolor }} />
+            <span className="votestart-val" style={{ color: pcolor }}>{pvoteStart.toFixed(1)}%</span>
+          </div>
+          <label className="fld-label">Ideologia de sortida <span className="hint-inline">(defineix el teu partit; després cada canvi costa capital)</span></label>
+          <div className="ideo-setup">
+            {IDEOS.map((name, i) => (
+              <div className="ideo-set-row" key={name}>
+                <span className="ideo-set-name">{name}</span>
+                <input type="range" min={0} max={10} step={1} value={pideo[i]}
+                  onChange={(e) => setPideo(pideo.map((x, j) => (j === i ? +e.target.value : x)))}
+                  style={{ accentColor: pcolor }} />
+                <span className="ideo-set-val" style={{ color: pcolor }}>{pideo[i]}</span>
+              </div>
+            ))}
+          </div>
+        </>
+      ) : (
+        <>
+          <label className="fld-label">Tria un partit del Parlament</label>
+          <div className="party-grid">
+            {BASE_PARTIES.map((p) => (
+              <button key={p.key} className={"party-pick " + (existing === p.key ? "on" : "")}
+                onClick={() => setExisting(p.key)} style={existing === p.key ? { borderColor: p.color } : {}}>
+                <span className="pick-dot" style={{ background: p.color }} />
+                <span className="pick-name">{p.name}</span>
+                <span className="pick-vote">{p.vote}%</span>
+              </button>
+            ))}
+          </div>
+          {ex && (
+            <div className="ex-preview">
+              <div className="ex-title" style={{ color: ex.color }}>{ex.name} — ideologia de partida</div>
+              <div className="ex-ideos">
+                {IDEOS.map((n, i) => (
+                  <div className="ex-ideo" key={n}><span>{n}</span><b style={{ color: ex.color }}>{ex.ideo[i]}</b></div>
+                ))}
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      <button className="btn-play" disabled={!canStart} onClick={start}
+        style={{ background: mode === "custom" ? pcolor : (ex ? ex.color : "#b7a274") }}>
+        COMENÇA LA PARTIDA
+      </button>
+
+      <button className="rules-toggle" onClick={() => setRules(!rules)}>{rules ? "▾" : "▸"} Com es juga</button>
+      {rules && <RulesText />}
+    </div>
+  );
+}
+
+function RulesText() {
+  return (
+    <div className="rules-box">
+      <p><b>Objectiu:</b> guanyar les eleccions. La teva moneda és el <b>Capital Polític (CP)</b>.</p>
+      <p><b>El secret:</b> cada torn hi ha un <b>MOMENTUM</b> ocult (0–10 per ideologia). Com més s'hi acosta la teva ideologia, més vots. El momentum es mou sol cada torn. Endevina'l mirant qui puja i qui baixa a l'enquesta.</p>
+      <p><b>Ajustos:</b> moure una ideologia un punt costa <b>1 CP</b>. Comences amb 10.</p>
+      <p><b>Eleccions</b> cada 5 torns: repartiment de 135 diputats per províncies (D'Hondt). Guanyes tant CP com diputats. Si guanyes, el momentum es reinicia.</p>
+      <p><b>Investidura:</b> els partits voten segons distància ideològica. Si votes SÍ guanyes CP, però investir algú molt llunyà et fa perdre vots.</p>
+      <p><b>Aprovació del líder:</b> si canvies massa la ideologia, les bases es cansen. Convoca un <b>congrés</b> (cada 6 torns) per ratificar el nou rumb. Si el perds: <b>fi de la partida</b>.</p>
+    </div>
+  );
+}
+
+/* -------------------------------- GAME ----------------------------------- */
+
+function Game({ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, overlay, rules, setRules }) {
+  const p = player(g);
+  const untilElection = Math.max(0, g.nextElectionAt - g.turn);
+  return (
+    <>
+      <TopBar g={g} />
+      <div className="content">
+        {tab === "partit" && <TabPartit g={g} adjustIdeo={adjustIdeo} convokeCongress={convokeCongress} rules={rules} setRules={setRules} />}
+        {tab === "resultats" && <TabResultats g={g} />}
+        {tab === "pais" && <TabPais g={g} />}
+      </div>
+
+      <div className="turnbar">
+        <div className="turn-info">
+          <span className="turn-n">TORN {g.turn}</span>
+          <span className="turn-el">Eleccions en {untilElection}</span>
+        </div>
+        <button className="btn-turn" onClick={passTurn} disabled={!!overlay} style={{ background: p.color }}>
+          PASSAR TORN ▸
+        </button>
+      </div>
+
+      <nav className="tabbar">
+        {[["partit", "Partit"], ["resultats", "Resultats"], ["pais", "País"]].map(([k, l]) => (
+          <button key={k} className={"tab " + (tab === k ? "on" : "")} onClick={() => setTab(k)}
+            style={tab === k ? { color: p.color, borderColor: p.color } : {}}>{l}</button>
+        ))}
+      </nav>
+    </>
+  );
+}
+
+function TopBar({ g }) {
+  const p = player(g);
+  const app = g.approval;
+  const appColor = app >= 60 ? "#3f7a4f" : app >= 35 ? "#c08a2e" : "#b23a2e";
+  return (
+    <div className="topbar">
+      <div className="tb-left">
+        <span className="tb-dot" style={{ background: p.color }} />
+        <span className="tb-name">{p.name}</span>
+      </div>
+      <div className="tb-right">
+        <div className="cp-chip"><span className="cp-num">{g.cp}</span><span className="cp-lbl">CP</span></div>
+      </div>
+      <div className="approvbar">
+        <div className="approv-fill" style={{ width: app + "%", background: appColor }} />
+        <span className="approv-txt">Aprovació del líder · {app}%</span>
+      </div>
+    </div>
+  );
+}
+
+/* ---- Tab PARTIT ---- */
+function TabPartit({ g, adjustIdeo, convokeCongress, rules, setRules }) {
+  const p = player(g);
+  const drift = ideoPenalty(p.ideo, g.approvedIdeo);
+  const congressReady = g.congressCooldown === 0 && !g.congressPending;
+  const { labels, series } = buildSeries(g.parties, g.pollHistory, (f) => f.votes);
+  const rels = g.parties.filter((x) => !x.isPlayer)
+    .map((x) => ({ party: x, score: relationScore(p.ideo, x.ideo) }))
+    .sort((a, b) => b.score - a.score);
+  return (
+    <div className="pad">
+      <SectionTitle>Ideologia del partit</SectionTitle>
+      <p className="muted xsmall">Cada punt que mous costa 1 CP. Els eixos marcats amb ★ són els més contundents del teu partit: moure'ls fa caure molt més l'aprovació.</p>
+      <div className="ideo-list compact">
+        {IDEOS.map((name, i) => {
+          const sensitive = g.approvedIdeo[i] >= 7;
+          return (
+            <div className="ideo-row" key={name}>
+              <button className="step" onClick={() => adjustIdeo(i, -1)} disabled={g.cp < 1 || p.ideo[i] <= 0}>–</button>
+              <span className="ideo-name">{sensitive && <span className="ideo-key" title="Eix bandera: moure'l afecta molt l'aprovació">★</span>}{name}</span>
+              <div className="ideo-track"><div className="ideo-fill" style={{ width: p.ideo[i] * 10 + "%", background: p.color }} /></div>
+              <span className="ideo-num" style={{ color: p.color }}>{p.ideo[i]}</span>
+              <button className="step" onClick={() => adjustIdeo(i, +1)} disabled={g.cp < 1 || p.ideo[i] >= 10}>+</button>
+            </div>
+          );
+        })}
+      </div>
+
+      <SectionTitle>Evolució d'intenció de vot</SectionTitle>
+      <div className="chart-box">
+        <MultiLineChart labels={labels} series={series} ySuffix="%" />
+        <p className="chart-cap">La teva línia és la gruixuda ({p.name}); la resta, en clar.</p>
+      </div>
+
+      <SectionTitle>Relacions amb els partits</SectionTitle>
+      <div className="rel-list">
+        {rels.map(({ party, score }) => {
+          const lab = relationLabel(score);
+          return (
+            <div className="rel-row" key={party.key}>
+              <span className="pdot sm" style={{ background: party.color }} />
+              <span className="rel-name">{party.name}</span>
+              <div className="rel-track"><div className="rel-fill" style={{ width: score + "%", background: lab.c }} /></div>
+              <span className="rel-tag" style={{ color: lab.c }}>{lab.t}</span>
+            </div>
+          );
+        })}
+      </div>
+      <p className="muted xsmall">Com més a prop ideològicament (ponderant molt nacionalisme, independentisme i immigració), més fàcil que t'investeixin o s'abstinguin.</p>
+
+      <SectionTitle>Congrés del partit</SectionTitle>
+      <div className="congress-box">
+        <div className="congress-row">
+          <span>Desviació del rumb ratificat (ponderada)</span>
+          <b style={{ color: drift > 3.5 ? "#b23a2e" : drift > 1.5 ? "#c08a2e" : "#3f7a4f" }}>{drift.toFixed(1)}</b>
+        </div>
+        <div className="congress-row">
+          <span>{g.congressPending ? "Congrés convocat" : congressReady ? "Es pot convocar" : `Disponible en ${g.congressCooldown} torns`}</span>
+        </div>
+        <button className="btn-congress" disabled={!congressReady} onClick={convokeCongress} style={{ borderColor: p.color, color: congressReady ? p.color : undefined }}>
+          {g.congressPending ? "PENDENT DE RESOLUCIÓ" : "CONVOCA CONGRÉS"}
+        </button>
+        <p className="muted xsmall">Ratifica la ideologia actual com a nou rumb i recupera aprovació. Si les bases el rebutgen, s'acaba la partida.</p>
+      </div>
+
+      <button className="rules-toggle" onClick={() => setRules(!rules)}>{rules ? "▾" : "▸"} Recorda les regles</button>
+      {rules && <RulesText />}
+    </div>
+  );
+}
+
+/* ---- Tab RESULTATS ---- */
+function TabResultats({ g }) {
+  const p = player(g);
+  const sortedPoll = [...g.poll].sort((a, b) => b.vote - a.vote);
+  const el = g.lastElection;
+  const sortedSeats = el ? [...g.parties].sort((a, b) => el.catalonia[b.key] - el.catalonia[a.key]) : [];
+  const pollSeries = buildSeries(g.parties, g.pollHistory, (f) => f.votes);
+  const elecFrames = g.electionHistory;
+  const elecSeries = buildSeries(g.parties, elecFrames, (f) => f.catalonia);
+  return (
+    <div className="pad">
+      <SectionTitle>Enquesta (intenció i diputats)</SectionTitle>
+      <div className="poll">
+        {sortedPoll.map((row) => {
+          const pt = byKey(g, row.key);
+          const up = row.delta > 0.05, down = row.delta < -0.05;
+          const sUp = row.seatDelta > 0, sDown = row.seatDelta < 0;
+          return (
+            <div className={"poll-row " + (pt.isPlayer ? "me" : "")} key={row.key}>
+              <span className="pdot" style={{ background: pt.color }} />
+              <span className="pname">{pt.name}</span>
+              <span className="pval">{row.vote.toFixed(1)}%</span>
+              <span className={"pdelta " + (up ? "u" : down ? "d" : "")}>{up ? "▲" : down ? "▼" : "—"}{Math.abs(row.delta) >= 0.05 ? Math.abs(row.delta).toFixed(1) : ""}</span>
+              <span className="pseat">{row.seats}<i>dip.</i></span>
+              <span className={"pdelta seatd " + (sUp ? "u" : sDown ? "d" : "")}>{sUp ? "▲" : sDown ? "▼" : "—"}{row.seatDelta !== 0 ? Math.abs(row.seatDelta) : ""}</span>
+            </div>
+          );
+        })}
+      </div>
+      <p className="muted xsmall">Diputats = projecció si avui fossin eleccions (D'Hondt per províncies). La ▲▼ és el canvi respecte al torn anterior.</p>
+
+      <SectionTitle>Historial d'enquestes</SectionTitle>
+      <div className="chart-box">
+        <MultiLineChart labels={pollSeries.labels} series={pollSeries.series} ySuffix="%" />
+      </div>
+
+      <SectionTitle>{el ? "Últimes eleccions" : "Encara no hi ha eleccions"}</SectionTitle>
+      {el ? (
+        <>
+          <SeatBar g={g} counts={el.catalonia} />
+          <div className="seat-list">
+            {sortedSeats.map((pt) => (
+              <div className={"seat-row " + (pt.isPlayer ? "me" : "")} key={pt.key}>
+                <span className="pdot" style={{ background: pt.color }} />
+                <span className="pname">{pt.name}</span>
+                <span className="seat-n">{el.catalonia[pt.key]}</span>
+              </div>
+            ))}
+          </div>
+          <div className="prov-grid">
+            {PROVINCES.map((pv) => (
+              <div className="prov" key={pv.key}>
+                <div className="prov-h">{pv.name} <span>({pv.seats})</span></div>
+                {[...g.parties].filter((pt) => el.provinces[pv.key][pt.key] > 0)
+                  .sort((a, b) => el.provinces[pv.key][b.key] - el.provinces[pv.key][a.key])
+                  .map((pt) => (
+                    <div className="prov-row" key={pt.key}>
+                      <span className="pdot sm" style={{ background: pt.color }} />
+                      <span className="prov-name">{pt.name}</span>
+                      <span className="prov-n">{el.provinces[pv.key][pt.key]}</span>
+                    </div>
+                  ))}
+              </div>
+            ))}
+          </div>
+
+          <SectionTitle>Historial d'eleccions (diputats)</SectionTitle>
+          <div className="chart-box">
+            <MultiLineChart labels={elecSeries.labels} series={elecSeries.series} height={150}
+              note="La primera cita electoral encara no ha arribat." />
+          </div>
+          <div className="hist-list">
+            {[...elecFrames].reverse().map((f) => {
+              const order = [...g.parties].sort((a, b) => f.catalonia[b.key] - f.catalonia[a.key]);
+              const win = order[0];
+              return (
+                <div className="hist-row" key={f.turn}>
+                  <span className="hist-turn">T{f.turn}</span>
+                  <span className="pdot sm" style={{ background: win.color }} />
+                  <span className="hist-win">{win.name}</span>
+                  <span className="hist-me" style={{ color: p.color }}>tu: {f.catalonia["PLAYER"]}</span>
+                </div>
+              );
+            })}
+          </div>
+        </>
+      ) : (
+        <p className="muted small empty">Passa torns i ajusta la ideologia. Les primeres eleccions arriben al torn 5.</p>
+      )}
+    </div>
+  );
+}
+
+function SeatBar({ g, counts }) {
+  const ordered = [...g.parties].sort((a, b) => counts[b.key] - counts[a.key]);
+  return (
+    <div className="seatbar-wrap">
+      <div className="seatbar">
+        {ordered.map((pt) => counts[pt.key] > 0 && (
+          <div key={pt.key} className="seatbar-seg" style={{ width: (counts[pt.key] / 135) * 100 + "%", background: pt.color }} title={pt.name} />
+        ))}
+        <div className="major-line" style={{ left: (MAJORIA / 135) * 100 + "%" }} />
+      </div>
+      <div className="seatbar-cap">Majoria absoluta: {MAJORIA} de 135</div>
+    </div>
+  );
+}
+
+/* ---- Tab PAÍS ---- */
+function TabPais({ g }) {
+  const items = [
+    { k: "pib", label: "PIB", val: g.pais.pib.toFixed(1) + "%", good: g.pais.pib >= 1.5 },
+    { k: "inflacio", label: "Inflació", val: g.pais.inflacio.toFixed(1) + "%", good: g.pais.inflacio <= 3.5 },
+    { k: "atur", label: "Atur", val: g.pais.atur.toFixed(1) + "%", good: g.pais.atur <= 10 },
+    { k: "benestar", label: "Benestar", val: g.pais.benestar + "/100", good: g.pais.benestar >= 55 },
+  ];
+  const gov = g.president ? byKey(g, g.president) : null;
+  return (
+    <div className="pad">
+      <SectionTitle>Govern</SectionTitle>
+      {gov ? (
+        <div className="gov-banner" style={{ borderColor: gov.color }}>
+          <span className="gov-dot" style={{ background: gov.color }} />
+          <div className="gov-info">
+            <span className="gov-lbl">President de la Generalitat</span>
+            <span className="gov-name" style={{ color: gov.color }}>{gov.name}{gov.isPlayer ? " (tu)" : ""}</span>
+          </div>
+          <span className="gov-seats">{g.lastElection ? g.lastElection.catalonia[gov.key] : "—"}<i>dip.</i></span>
+        </div>
+      ) : (
+        <div className="gov-banner none">
+          <div className="gov-info">
+            <span className="gov-lbl">Sense govern</span>
+            <span className="gov-name">Cap partit investit ara mateix</span>
+          </div>
+        </div>
+      )}
+
+      <SectionTitle>Estat del país</SectionTitle>
+      <div className="pais-grid">
+        {items.map((it) => (
+          <div className="pais-card" key={it.k}>
+            <div className="pais-label">{it.label}</div>
+            <div className="pais-val" style={{ color: it.good ? "#3f7a4f" : "#b23a2e" }}>{it.val}</div>
+          </div>
+        ))}
+      </div>
+      <p className="muted small">
+        Els indicadors evolucionen cada torn i el govern hi influeix. (Mòdul bàsic — a desenvolupar.)
+      </p>
+      <SectionTitle>Palmarès</SectionTitle>
+      <div className="palmares">
+        <div className="palm"><span>Eleccions guanyades</span><b>{g.electionsWon}</b></div>
+        <div className="palm"><span>Presidències</span><b>{g.presidencies}</b></div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------------------------- OVERLAYS ------------------------------------ */
+
+function ElectionOverlay({ g, election, onContinue }) {
+  const { res, playerSeats, won, deltas, prevExists } = election;
+  const p = player(g);
+  const winner = byKey(g, res.winner);
+  const ordered = [...g.parties].sort((a, b) => res.catalonia[b.key] - res.catalonia[a.key]);
+  const [stage, setStage] = useState("count"); // count → done
+  const [pct, setPct] = useState(0);
+  const [disp, setDisp] = useState(() => {
+    const o = {};
+    ordered.forEach((pt) => (o[pt.key] = Math.max(0, Math.round(res.catalonia[pt.key] + (Math.random() * 2 - 1) * 15))));
+    return o;
+  });
+  const [showProv, setShowProv] = useState(false);
+
+  useEffect(() => {
+    if (stage !== "count") return;
+    let cur = 0;
+    const id = setInterval(() => {
+      cur = Math.min(100, cur + 3);
+      const amp = 15 * (1 - cur / 100); // oscil·lació ±15 que s'esmorteeix
+      const nd = {};
+      ordered.forEach((pt) => {
+        const jit = cur >= 100 ? 0 : (Math.random() * 2 - 1) * amp;
+        nd[pt.key] = Math.max(0, Math.min(135, Math.round(res.catalonia[pt.key] + jit)));
+      });
+      setDisp(nd);
+      setPct(cur);
+      if (cur >= 100) { clearInterval(id); setStage("done"); }
+    }, 60);
+    return () => clearInterval(id);
+  }, [stage]);
+
+  const skip = () => {
+    const fd = {};
+    ordered.forEach((pt) => (fd[pt.key] = res.catalonia[pt.key]));
+    setDisp(fd); setPct(100); setStage("done");
+  };
+  const totalDisp = Math.max(1, ordered.reduce((s, pt) => s + (disp[pt.key] || 0), 0));
+
+  // etiqueta de variació de diputats vs eleccions anteriors
+  const chg = (k) => {
+    if (!prevExists || deltas[k] == null) return null;
+    const d = deltas[k];
+    return <span className={"seatchg " + (d > 0 ? "u" : d < 0 ? "d" : "")}>{d > 0 ? "▲" + d : d < 0 ? "▼" + -d : "="}</span>;
+  };
+
+  return (
+    <div className="overlay">
+      <div className="sheet election-sheet">
+        <div className="ov-kicker">NIT ELECTORAL · TORN {g.turn}</div>
+
+        {stage === "count" ? (
+          <>
+            <div className="ov-title">Escrutini</div>
+            <div className="count-pct">{pct}% escrutat</div>
+            <div className="seatbar-wrap">
+              <div className="seatbar">
+                {ordered.map((pt) => (disp[pt.key] || 0) > 0 && (
+                  <div key={pt.key} className="seatbar-seg" style={{ width: (disp[pt.key] / totalDisp) * 100 + "%", background: pt.color }} />
+                ))}
+                <div className="major-line" style={{ left: (MAJORIA / 135) * 100 + "%" }} />
+              </div>
+              <div className="seatbar-cap">Recompte en curs…</div>
+            </div>
+            <div className="seat-list">
+              {ordered.map((pt) => (
+                <div className={"seat-row " + (pt.isPlayer ? "me" : "")} key={pt.key}>
+                  <span className="pdot" style={{ background: pt.color }} />
+                  <span className="pname">{pt.name}</span>
+                  <span className="seat-n counting">{disp[pt.key]}</span>
+                </div>
+              ))}
+            </div>
+            <button className="ov-btn" onClick={skip}>Saltar recompte ▸</button>
+          </>
+        ) : (
+          <>
+            <div className="ov-title reveal-pop">Escrutini</div>
+            <SeatBar g={g} counts={res.catalonia} />
+            <div className="result-head reveal-pop" style={{ borderColor: won ? p.color : "#c9b48a" }}>
+              <div className="rh-line"><span>El teu partit</span><b style={{ color: p.color }}>{playerSeats} dip. {chg("PLAYER")}</b></div>
+              <div className="rh-line"><span>Guanyador</span><b style={{ color: winner.color }}>{winner.name}</b></div>
+              <div className={"rh-verdict " + (won ? "win" : "")}>
+                {won ? "🏆 Has guanyat les eleccions! (+CP, momentum reiniciat)" : `Sumes +${playerSeats} CP`}
+              </div>
+            </div>
+
+            <div className="seat-list">
+              {ordered.map((pt) => (
+                <div className={"seat-row " + (pt.isPlayer ? "me" : "")} key={pt.key}>
+                  <span className="pdot" style={{ background: pt.color }} />
+                  <span className="pname">{pt.name}</span>
+                  {chg(pt.key)}
+                  <span className="seat-n">{res.catalonia[pt.key]}</span>
+                </div>
+              ))}
+            </div>
+            {prevExists && <p className="muted xsmall">▲▼ = diferència de diputats respecte a les eleccions anteriors.</p>}
+
+            {!showProv ? (
+              <button className="ov-btn" onClick={() => setShowProv(true)}>Veure per províncies ▾</button>
+            ) : (
+              <div className="prov-grid ov">
+                {PROVINCES.map((pv) => (
+                  <div className="prov" key={pv.key}>
+                    <div className="prov-h">{pv.name} <span>({pv.seats})</span></div>
+                    {[...g.parties].filter((pt) => res.provinces[pv.key][pt.key] > 0)
+                      .sort((a, b) => res.provinces[pv.key][b.key] - res.provinces[pv.key][a.key])
+                      .map((pt) => (
+                        <div className="prov-row" key={pt.key}>
+                          <span className="pdot sm" style={{ background: pt.color }} />
+                          <span className="prov-name">{pt.name}</span>
+                          <span className="prov-n">{res.provinces[pv.key][pt.key]}</span>
+                        </div>
+                      ))}
+                  </div>
+                ))}
+              </div>
+            )}
+            <button className="ov-btn primary" onClick={onContinue} style={{ background: p.color }}>Continuar a la investidura ▸</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function InvestitureOverlay({ g, inv, onCast, onAuto, onRound2, onNext }) {
+  const candKey = inv.order[inv.idx];
+  const cand = byKey(g, candKey);
+  const isPlayerCand = candKey === "PLAYER";
+  const p = player(g);
+  const r = inv.result;
+
+  useEffect(() => {
+    if (isPlayerCand && inv.phase === "choose") onAuto();
+    // eslint-disable-next-line
+  }, [inv.idx, inv.phase]);
+
+  const showRound = inv.phase === "r1" || inv.phase === "r2";
+  const passedNow = r && ((inv.phase === "r1" && r.round1Pass) || (inv.phase === "r2" && r.round2Pass));
+
+  return (
+    <div className="overlay">
+      <div className="sheet">
+        <div className="ov-kicker">INVESTIDURA · CANDIDAT {inv.idx + 1} DE {inv.order.length}</div>
+        <div className="ov-title" style={{ color: cand.color }}>{cand.name}</div>
+        <div className="ov-sub">candidat/a a la presidència ({g.lastElection.catalonia[candKey]} diputats)</div>
+
+        {inv.phase === "choose" && !isPlayerCand && (
+          <>
+            <p className="muted small center">Com vota el teu partit la investidura de {cand.name}?</p>
+            <div className="vote-btns">
+              <button className="vb si" onClick={() => onCast("SÍ")}>SÍ</button>
+              <button className="vb abs" onClick={() => onCast("ABS")}>ABSTENCIÓ</button>
+              <button className="vb no" onClick={() => onCast("NO")}>NO</button>
+            </div>
+            <p className="muted xsmall center">Distància ideològica amb tu: <b>{wdist(p.ideo, cand.ideo).toFixed(1)}</b>. Investir algú molt llunyà et fa perdre vots.</p>
+          </>
+        )}
+
+        {showRound && r && (
+          <>
+            <div className={"round-tag " + (inv.phase === "r2" ? "r2" : "")}>
+              {inv.phase === "r1" ? "1a VOTACIÓ · cal majoria absoluta (68)" : "2a VOTACIÓ · majoria simple (SÍ > NO)"}
+            </div>
+            <div className="vote-tally">
+              <div className="tally-seg si" style={{ flex: Math.max(0.05, r.siSeats) }}>SÍ {r.siSeats}</div>
+              <div className="tally-seg abs" style={{ flex: Math.max(0.05, r.absSeats) }}>ABS {r.absSeats}</div>
+              <div className="tally-seg no" style={{ flex: Math.max(0.05, r.noSeats) }}>NO {r.noSeats}</div>
+            </div>
+            <div className="vote-list">
+              {r.votes.slice().sort((a, b) => b.seats - a.seats).map((v) => {
+                const pt = byKey(g, v.key);
+                return (
+                  <div className={"vote-row " + (pt.isPlayer ? "me" : "")} key={v.key}>
+                    <span className="pdot sm" style={{ background: pt.color }} />
+                    <span className="vname">{pt.name}</span>
+                    <span className="vseats">{v.seats}</span>
+                    <span className={"vvote " + (v.vote === "SÍ" ? "si" : v.vote === "NO" ? "no" : "abs")}>{v.vote}</span>
+                  </div>
+                );
+              })}
+            </div>
+
+            {inv.phase === "r1" && !r.round1Pass && (
+              <div className="round-note">Sense majoria absoluta: {r.siSeats} SÍ (calen 68). Es passa a la segona votació, on les abstencions ja no bloquegen.</div>
+            )}
+            {passedNow ? (
+              <div className="inv-verdict ok">
+                {isPlayerCand
+                  ? `🏛️ Investit president a la ${inv.phase === "r1" ? "1a" : "2a"} votació! +5 CP`
+                  : `${cand.name} és investit/da a la ${inv.phase === "r1" ? "1a" : "2a"} votació${inv.playerVote === "SÍ" ? " · +2 CP pel teu sí" : ""}`}
+              </div>
+            ) : inv.phase === "r2" ? (
+              <div className="inv-verdict ko">Investidura fracassada ({r.siSeats} SÍ vs {r.noSeats} NO)</div>
+            ) : null}
+
+            <button className="ov-btn primary" style={{ background: p.color }}
+              onClick={inv.phase === "r1" && !r.round1Pass ? onRound2 : onNext}>
+              {inv.phase === "r1" && !r.round1Pass
+                ? "Passar a la 2a votació ▸"
+                : r.pass ? "Tornar al joc ▸" : (inv.idx + 1 < inv.order.length ? "Següent candidat ▸" : "Repetició electoral ▸")}
+            </button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function CongressOverlay({ congress, onClose }) {
+  return (
+    <div className="overlay">
+      <div className="sheet center-sheet">
+        <div className="ov-kicker">CONGRÉS DEL PARTIT</div>
+        <div className={"congress-verdict " + (congress.pass ? "ok" : "ko")}>{congress.pass ? "RATIFICAT" : "REBUTJAT"}</div>
+        <p className="muted small center">Suport de les bases: <b>{congress.support}%</b></p>
+        <p className="muted small center">
+          {congress.pass ? "Les bases avalen el nou rumb ideològic. Aprovació recuperada." : "Les bases et giren l'esquena."}
+        </p>
+        <button className="ov-btn primary" onClick={onClose}>{congress.pass ? "Continuar ▸" : "Veure final ▸"}</button>
+      </div>
+    </div>
+  );
+}
+
+function GameOverOverlay({ gameover, onRestart }) {
+  const g = gameover.g;
+  return (
+    <div className="overlay">
+      <div className="sheet center-sheet">
+        <div className="ov-kicker">FI DE LA PARTIDA</div>
+        <div className="gameover-title">GAME OVER</div>
+        <p className="muted small center">{gameover.reason}</p>
+        <div className="final-stats">
+          <div><b>{g.turn}</b><span>torns</span></div>
+          <div><b>{g.electionsWon}</b><span>eleccions</span></div>
+          <div><b>{g.presidencies}</b><span>presidències</span></div>
+        </div>
+        <button className="ov-btn primary" onClick={onRestart}>Nova partida ▸</button>
+      </div>
+    </div>
+  );
+}
+
+function SectionTitle({ children }) {
+  return <div className="sec-title"><span>{children}</span></div>;
+}
+
+/* --------- Gràfic de línies (SVG, vintage) --------- */
+function buildSeries(parties, frames, getMap) {
+  const labels = frames.map((f) => f.turn);
+  const series = parties.map((p) => ({
+    key: p.key, color: p.color, isPlayer: !!p.isPlayer,
+    vals: frames.map((f) => getMap(f)[p.key] ?? 0),
+  }));
+  return { labels, series };
+}
+
+function MultiLineChart({ labels, series, ySuffix = "", height = 140, note }) {
+  if (!labels || labels.length < 2) {
+    return <p className="muted xsmall empty">{note || "Encara no hi ha prou dades per dibuixar l'evolució. Passa uns quants torns."}</p>;
+  }
+  const W = 320, H = height, padL = 28, padR = 8, padT = 10, padB = 18;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const maxVal = Math.max(1, ...series.flatMap((s) => s.vals));
+  const yMax = Math.ceil(maxVal / 5) * 5 || 5;
+  const n = labels.length;
+  const xAt = (i) => padL + (n === 1 ? plotW / 2 : (i / (n - 1)) * plotW);
+  const yAt = (v) => padT + plotH - (v / yMax) * plotH;
+  const ticks = [0, yMax / 2, yMax];
+  // etiquetes x: primera, mitja, última
+  const xIdx = [0, Math.floor((n - 1) / 2), n - 1].filter((v, i, a) => a.indexOf(v) === i);
+  const ordered = [...series].sort((a, b) => (a.isPlayer ? 1 : 0) - (b.isPlayer ? 1 : 0)); // jugador a sobre
+  return (
+    <svg className="linechart" viewBox={`0 0 ${W} ${H}`} width="100%" preserveAspectRatio="xMidYMid meet">
+      {ticks.map((t, i) => (
+        <g key={i}>
+          <line x1={padL} y1={yAt(t)} x2={W - padR} y2={yAt(t)} className="lc-grid" />
+          <text x={padL - 5} y={yAt(t) + 3} className="lc-ylab">{Math.round(t)}{ySuffix}</text>
+        </g>
+      ))}
+      {xIdx.map((i) => (
+        <text key={i} x={xAt(i)} y={H - 5} className="lc-xlab" textAnchor="middle">T{labels[i]}</text>
+      ))}
+      {ordered.map((s) => {
+        const d = s.vals.map((v, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(" ");
+        return (
+          <g key={s.key}>
+            <path d={d} fill="none" stroke={s.color} strokeWidth={s.isPlayer ? 2.6 : 1.3}
+              opacity={s.isPlayer ? 1 : 0.45} strokeLinejoin="round" strokeLinecap="round" />
+            {s.isPlayer && <circle cx={xAt(n - 1)} cy={yAt(s.vals[n - 1])} r="3.4" fill={s.color} stroke="#F1E9D2" strokeWidth="1.4" />}
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+/* --------- Finestra de resum de torn --------- */
+function TurnSummaryOverlay({ g, ts, onClose }) {
+  const p = player(g);
+  const me = ts.poll.find((r) => r.key === "PLAYER");
+  const meParty = byKey(g, "PLAYER");
+  const vUp = me.delta > 0.05, vDown = me.delta < -0.05;
+  const sUp = me.seatDelta > 0, sDown = me.seatDelta < 0;
+  return (
+    <div className="overlay">
+      <div className="sheet">
+        <div className="ov-kicker">RESUM DEL TORN {ts.turn}</div>
+        <div className="ov-title" style={{ color: p.color, fontSize: 22 }}>{p.name}</div>
+        <div className="ts-cards">
+          <div className="ts-card">
+            <span className="ts-lbl">Intenció de vot</span>
+            <b className="ts-val" style={{ color: p.color }}>{me.vote.toFixed(1)}%</b>
+            <span className={"ts-delta " + (vUp ? "u" : vDown ? "d" : "")}>
+              {vUp ? "▲" : vDown ? "▼" : "—"} {Math.abs(me.delta).toFixed(1)} punts
+            </span>
+          </div>
+          <div className="ts-card">
+            <span className="ts-lbl">Diputats projectats</span>
+            <b className="ts-val" style={{ color: p.color }}>{me.seats}</b>
+            <span className={"ts-delta " + (sUp ? "u" : sDown ? "d" : "")}>
+              {sUp ? "▲" : sDown ? "▼" : "—"} {Math.abs(me.seatDelta)} diputats
+            </span>
+          </div>
+        </div>
+        <div className="ts-listhead">
+          <span className="ts-name">Partit</span>
+          <span className="ts-seat">Dip.</span>
+          <span className="ts-vote">Vot</span>
+          <span style={{ width: 40 }}></span>
+        </div>
+        <div className="ts-list">
+          {ts.poll.map((row) => {
+            const pt = byKey(g, row.key);
+            const u = row.delta > 0.05, d = row.delta < -0.05;
+            return (
+              <div className={"ts-row " + (pt.isPlayer ? "me" : "")} key={row.key}>
+                <span className="pdot" style={{ background: pt.color }} />
+                <span className="ts-name">{pt.name}</span>
+                <span className="ts-seat">{row.seats}</span>
+                <span className="ts-vote">{row.vote.toFixed(1)}%</span>
+                <span className={"pdelta " + (u ? "u" : d ? "d" : "")} style={{ width: 40 }}>
+                  {u ? "▲" : d ? "▼" : "—"}{Math.abs(row.delta) >= 0.05 ? Math.abs(row.delta).toFixed(1) : ""}
+                </span>
+              </div>
+            );
+          })}
+        </div>
+        <button className="ov-btn primary" onClick={onClose} style={{ background: p.color }}>Continuar ▸</button>
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------- ESTILS ---------------------------------- */
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Oswald:wght@400;500;600;700&family=Bitter:ital,wght@0,400;0,600;0,700;1,400&display=swap');
+
+.cp-root{
+  --paper:#E7DEC6; --paper2:#F1E9D2; --panel:#F5EEDA; --panelHi:#FBF6E6;
+  --ink:#2C261D; --inksoft:#6E6250; --line:#CBB88C; --lineDk:#B39E6E;
+  --red:#B23A2E; --gold:#C08A2E; --green:#3f7a4f;
+  --display:Georgia, 'Times New Roman', 'Bitter', serif;
+  min-height:100vh; width:100%; display:flex; align-items:stretch; justify-content:center;
+  background: radial-gradient(circle at 30% 20%, #efe7d0, #ddd2b6 90%);
+  padding:0; box-sizing:border-box;
+  font-family:'Bitter', Georgia, 'Times New Roman', serif; color:var(--ink);
+}
+.cp-root *{ box-sizing:border-box; }
+.phone{
+  width:100%; max-width:1100px; height:100vh;
+  background:var(--paper); position:relative; overflow:hidden;
+  border:none; box-shadow:0 0 60px rgba(60,48,28,.18); border-radius:0;
+  display:flex; flex-direction:column;
+}
+
+/* headings/type */
+.masthead{ padding:26px 22px 4px; text-align:center; }
+.masthead-rule{ height:3px; background:var(--ink); margin:6px 0; }
+.masthead-rule:last-of-type{ height:1px; }
+.masthead-title{ font-family:var(--display); font-weight:700; font-size:40px; letter-spacing:3px; line-height:1; }
+.masthead-sub{ font-style:italic; font-size:12.5px; color:var(--inksoft); margin:7px 0 6px; letter-spacing:.4px; }
+
+.content{ flex:1; overflow-y:auto; overflow-x:hidden; }
+.content::-webkit-scrollbar{ width:8px; }
+.content::-webkit-scrollbar-thumb{ background:var(--lineDk); border-radius:4px; }
+.pad{ padding:16px 22px 24px; }
+.setup{ padding:0 18px 28px; max-width:560px; margin:0 auto; }
+
+.sec-title{ display:flex; align-items:center; gap:10px; margin:18px 0 10px; font-family:'Oswald',sans-serif; font-weight:600; font-size:14px; letter-spacing:1.5px; text-transform:uppercase; }
+.sec-title span{ white-space:nowrap; }
+.sec-title:after{ content:""; flex:1; height:2px; background:var(--ink); opacity:.85; }
+.muted{ color:var(--inksoft); }
+.small{ font-size:12.5px; line-height:1.5; } .xsmall{ font-size:11px; line-height:1.45; } .center{ text-align:center; }
+.empty{ padding:10px 0; }
+.hint-inline{ font-weight:400; font-style:italic; font-size:11px; color:var(--inksoft); }
+
+/* setup */
+.modeswitch{ display:flex; gap:8px; margin:6px 0 16px; }
+.mode{ flex:1; padding:11px; border:1.5px solid var(--lineDk); background:var(--panel); font-family:'Oswald',sans-serif; letter-spacing:1px; font-size:12.5px; text-transform:uppercase; cursor:pointer; color:var(--inksoft); border-radius:3px; }
+.mode.on{ background:var(--ink); color:var(--paper2); border-color:var(--ink); }
+.fld-label{ display:block; font-family:'Oswald',sans-serif; font-size:12px; letter-spacing:1px; text-transform:uppercase; margin:14px 0 6px; }
+.text-in{ width:100%; padding:11px 12px; border:1.5px solid var(--lineDk); background:var(--panelHi); font-family:'Bitter',serif; font-size:15px; color:var(--ink); border-radius:3px; }
+.text-in:focus{ outline:none; border-color:var(--ink); }
+.swatches{ display:flex; gap:9px; }
+.swatch{ width:38px; height:38px; border-radius:50%; border:2px solid var(--paper2); cursor:pointer; box-shadow:0 0 0 1.5px var(--lineDk); }
+.swatch.on{ box-shadow:0 0 0 2px var(--ink), 0 0 0 5px var(--paper); transform:scale(1.06); }
+.votestart{ display:flex; align-items:center; gap:12px; background:var(--panel); border:1.5px solid var(--lineDk); border-radius:4px; padding:8px 12px; }
+.votestart input[type=range]{ flex:1; }
+.votestart-val{ font-family:var(--display); font-weight:700; font-size:20px; width:56px; text-align:right; }
+
+.ideo-setup{ background:var(--panel); border:1.5px solid var(--lineDk); border-radius:4px; padding:6px 12px; }
+.ideo-set-row{ display:grid; grid-template-columns:1fr 120px 22px; align-items:center; gap:8px; padding:5px 0; border-bottom:1px dashed var(--line); }
+.ideo-set-row:last-child{ border-bottom:none; }
+.ideo-set-name{ font-family:'Oswald',sans-serif; font-size:11px; letter-spacing:.6px; }
+.ideo-set-val{ font-weight:700; text-align:right; font-size:15px; }
+input[type=range]{ width:100%; }
+
+.party-grid{ display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+.party-pick{ display:flex; align-items:center; gap:8px; padding:11px 10px; border:1.5px solid var(--lineDk); background:var(--panel); cursor:pointer; border-radius:4px; text-align:left; }
+.party-pick.on{ background:var(--panelHi); border-width:2px; }
+.pick-dot{ width:14px; height:14px; border-radius:50%; flex:none; }
+.pick-name{ font-family:'Oswald',sans-serif; font-size:13px; flex:1; }
+.pick-vote{ font-size:12px; color:var(--inksoft); font-weight:600; }
+.ex-preview{ margin-top:14px; border:1.5px solid var(--lineDk); background:var(--panel); border-radius:4px; padding:12px; }
+.ex-title{ font-family:'Oswald',sans-serif; font-size:13px; letter-spacing:.5px; margin-bottom:8px; }
+.ex-ideos{ display:grid; grid-template-columns:1fr 1fr; gap:4px 14px; }
+.ex-ideo{ display:flex; justify-content:space-between; font-size:11px; border-bottom:1px dashed var(--line); padding:2px 0; }
+.ex-ideo span{ color:var(--inksoft); }
+
+.btn-play{ width:100%; margin-top:20px; padding:16px; border:none; color:#fff; font-family:'Oswald',sans-serif; font-weight:600; font-size:16px; letter-spacing:2px; cursor:pointer; border-radius:4px; box-shadow:0 3px 0 rgba(0,0,0,.25); }
+.btn-play:disabled{ opacity:.45; cursor:not-allowed; }
+.rules-toggle{ width:100%; margin-top:14px; background:none; border:none; color:var(--inksoft); font-family:'Oswald',sans-serif; letter-spacing:1px; font-size:12px; text-transform:uppercase; cursor:pointer; text-align:left; padding:6px 2px; }
+.rules-box{ background:var(--panel); border-left:3px solid var(--ink); padding:10px 14px; }
+.rules-box p{ font-size:12px; line-height:1.55; margin:7px 0; color:#40382b; }
+
+/* topbar */
+.topbar{ background:var(--ink); color:var(--paper2); padding:12px 16px 0; }
+.tb-left{ display:inline-flex; align-items:center; gap:8px; }
+.tb-dot{ width:13px; height:13px; border-radius:50%; box-shadow:0 0 0 2px var(--paper2); }
+.tb-name{ font-family:'Oswald',sans-serif; font-size:16px; letter-spacing:.5px; }
+.tb-right{ float:right; }
+.cp-chip{ display:inline-flex; align-items:baseline; gap:4px; background:var(--paper2); color:var(--ink); padding:4px 11px; border-radius:20px; }
+.cp-num{ font-family:'Oswald',sans-serif; font-weight:700; font-size:17px; }
+.cp-lbl{ font-size:10px; letter-spacing:1px; }
+.approvbar{ position:relative; height:20px; margin:11px -16px 0; background:#241f18; overflow:hidden; }
+.approv-fill{ position:absolute; left:0; top:0; bottom:0; transition:width .4s ease; }
+.approv-txt{ position:relative; z-index:2; font-size:10.5px; line-height:20px; padding-left:12px; letter-spacing:.6px; color:#fff; font-family:'Oswald',sans-serif; }
+
+/* ideology in game — compacte, una sola fila */
+.ideo-list{ display:flex; flex-direction:column; gap:5px; }
+.ideo-list.compact .ideo-row{ display:flex; align-items:center; gap:7px; background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:4px 7px; }
+.ideo-name{ font-family:'Oswald',sans-serif; font-size:10.5px; letter-spacing:.4px; width:104px; flex:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ideo-key{ color:var(--gold); font-size:11px; margin-right:3px; }
+.ideo-num{ font-family:'Oswald',sans-serif; font-weight:700; font-size:14px; width:20px; text-align:right; flex:none; }
+.ideo-track{ flex:1; height:7px; background:#ddd0ad; border-radius:5px; overflow:hidden; box-shadow:inset 0 1px 2px rgba(0,0,0,.15); }
+.ideo-fill{ height:100%; transition:width .2s ease; }
+.ideo-list.compact .step{ width:24px; height:24px; }
+.step{ width:30px; height:30px; flex:none; border:1.5px solid var(--lineDk); background:var(--panelHi); font-size:16px; line-height:1; cursor:pointer; border-radius:4px; color:var(--ink); font-family:'Oswald',sans-serif; }
+.step:disabled{ opacity:.3; cursor:not-allowed; }
+
+/* charts */
+.chart-box{ background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:8px 8px 4px; }
+.linechart{ display:block; }
+.lc-grid{ stroke:var(--line); stroke-width:1; opacity:.7; }
+.lc-ylab{ fill:var(--inksoft); font-family:'Oswald',sans-serif; font-size:8.5px; text-anchor:end; }
+.lc-xlab{ fill:var(--inksoft); font-family:'Oswald',sans-serif; font-size:8.5px; }
+.chart-cap{ font-size:10px; color:var(--inksoft); font-style:italic; margin:4px 2px 2px; }
+
+/* relacions */
+.rel-list{ display:flex; flex-direction:column; gap:4px; }
+.rel-row{ display:flex; align-items:center; gap:8px; padding:4px 6px; }
+.rel-name{ font-family:'Oswald',sans-serif; font-size:12px; width:86px; flex:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.rel-track{ flex:1; height:8px; background:#ddd0ad; border-radius:5px; overflow:hidden; box-shadow:inset 0 1px 2px rgba(0,0,0,.15); }
+.rel-fill{ height:100%; transition:width .4s ease; }
+.rel-tag{ font-family:'Oswald',sans-serif; font-size:10.5px; letter-spacing:.5px; width:52px; text-align:right; flex:none; }
+
+/* historial d'eleccions */
+.hist-list{ display:flex; flex-direction:column; gap:2px; margin-top:8px; }
+.hist-row{ display:flex; align-items:center; gap:8px; padding:4px 6px; font-size:12px; border-bottom:1px dashed var(--line); }
+.hist-turn{ font-family:'Oswald',sans-serif; font-weight:600; color:var(--inksoft); width:30px; flex:none; }
+.hist-win{ font-family:'Oswald',sans-serif; flex:1; }
+.hist-me{ font-family:'Oswald',sans-serif; font-size:11px; }
+
+/* turn summary */
+.ts-cards{ display:flex; gap:8px; margin:6px 0 10px; }
+.ts-card{ flex:1; background:var(--panelHi); border:1px solid var(--line); border-radius:5px; padding:7px 8px; text-align:center; display:flex; flex-direction:column; gap:1px; }
+.ts-lbl{ font-family:'Oswald',sans-serif; font-size:9px; letter-spacing:.5px; text-transform:uppercase; color:var(--inksoft); }
+.ts-val{ font-family:var(--display); font-weight:700; font-size:19px; }
+.ts-delta{ font-family:'Oswald',sans-serif; font-size:9.5px; color:var(--inksoft); }
+.ts-delta.u{ color:#3f7a4f; } .ts-delta.d{ color:#b23a2e; }
+.ts-listhead{ display:flex; align-items:center; gap:9px; padding:2px 8px; font-family:'Oswald',sans-serif; font-size:10px; letter-spacing:.6px; text-transform:uppercase; color:var(--inksoft); border-bottom:1.5px solid var(--ink); }
+.ts-listhead .ts-name{ flex:1; }
+.ts-list{ display:flex; flex-direction:column; gap:1px; margin:3px 0 8px; }
+.ts-row{ display:flex; align-items:center; gap:9px; padding:7px 8px; border-radius:3px; font-size:16px; border-bottom:1px dashed var(--line); }
+.ts-row.me{ background:var(--panelHi); box-shadow:inset 0 0 0 1.5px var(--lineDk); }
+.ts-name{ font-family:'Oswald',sans-serif; font-size:16px; flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.ts-seat{ font-family:var(--display); font-weight:700; font-size:19px; width:44px; text-align:right; }
+.ts-vote{ font-family:'Oswald',sans-serif; font-size:15px; width:60px; text-align:right; }
+
+.congress-box{ background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:12px; }
+.congress-row{ display:flex; justify-content:space-between; font-size:12.5px; padding:3px 0; }
+.btn-congress{ width:100%; margin:9px 0 6px; padding:12px; background:var(--panelHi); border:2px solid var(--lineDk); font-family:'Oswald',sans-serif; letter-spacing:1.5px; font-size:13px; text-transform:uppercase; cursor:pointer; border-radius:4px; }
+.btn-congress:disabled{ opacity:.4; cursor:not-allowed; }
+
+/* poll & seats */
+.poll{ display:flex; flex-direction:column; gap:4px; }
+.poll-row, .seat-row{ display:flex; align-items:center; gap:6px; padding:5px 7px; border-radius:3px; }
+.poll-row.me, .seat-row.me{ background:var(--panelHi); box-shadow:inset 0 0 0 1.5px var(--lineDk); }
+.pdot{ width:12px; height:12px; border-radius:50%; flex:none; }
+.pdot.sm{ width:9px; height:9px; }
+.pname{ font-family:'Oswald',sans-serif; font-size:12.5px; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.pbar{ flex:1; height:11px; background:#ddd0ad; border-radius:6px; overflow:hidden; }
+.pbar-fill{ height:100%; transition:width .4s ease; }
+.pval{ font-family:'Oswald',sans-serif; font-size:12.5px; width:46px; text-align:right; flex:none; }
+.pdelta{ font-size:10px; width:32px; text-align:right; color:var(--inksoft); font-family:'Oswald',sans-serif; flex:none; }
+.pdelta.u{ color:#3f7a4f; } .pdelta.d{ color:#b23a2e; }
+.pdelta.seatd{ width:26px; }
+.pseat{ font-family:'Oswald',sans-serif; font-size:13px; font-weight:600; width:48px; text-align:right; flex:none; }
+.pseat i{ font-style:normal; font-weight:400; font-size:9px; color:var(--inksoft); margin-left:2px; }
+.seat-n{ margin-left:auto; font-family:'Oswald',sans-serif; font-weight:700; font-size:16px; }
+.seat-list{ display:flex; flex-direction:column; gap:2px; margin-top:10px; }
+
+.seatbar-wrap{ margin:4px 0 6px; }
+.seatbar{ position:relative; display:flex; height:26px; border:1.5px solid var(--ink); border-radius:4px; overflow:hidden; background:#ddd0ad; }
+.seatbar-seg{ height:100%; } 
+.major-line{ position:absolute; top:-3px; bottom:-3px; width:2px; background:var(--ink); }
+.major-line:after{ content:"68"; position:absolute; top:-13px; left:-6px; font-size:9px; font-family:'Oswald',sans-serif; }
+.seatbar-cap{ font-size:10.5px; color:var(--inksoft); text-align:right; margin-top:4px; font-style:italic; }
+
+.prov-grid{ display:grid; grid-template-columns:1fr 1fr; gap:9px; margin-top:12px; }
+.prov-grid.ov{ margin-top:10px; }
+.prov{ background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:8px 9px; }
+.prov-h{ font-family:'Oswald',sans-serif; font-size:11.5px; letter-spacing:.5px; border-bottom:1.5px solid var(--ink); padding-bottom:4px; margin-bottom:5px; }
+.prov-h span{ color:var(--inksoft); font-weight:400; }
+.prov-row{ display:flex; align-items:center; gap:6px; padding:1.5px 0; font-size:11.5px; }
+.prov-name{ flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.prov-n{ font-family:'Oswald',sans-serif; font-weight:600; }
+
+/* país */
+.gov-banner{ display:flex; align-items:center; gap:14px; background:var(--panelHi); border:2px solid var(--line); border-radius:6px; padding:14px 16px; }
+.gov-banner.none{ border-style:dashed; }
+.gov-dot{ width:26px; height:26px; border-radius:50%; flex:none; box-shadow:0 0 0 3px var(--paper2), 0 0 0 4px var(--line); }
+.gov-info{ display:flex; flex-direction:column; flex:1; min-width:0; }
+.gov-lbl{ font-family:'Oswald',sans-serif; font-size:10.5px; letter-spacing:1px; text-transform:uppercase; color:var(--inksoft); }
+.gov-name{ font-family:var(--display); font-weight:700; font-size:24px; line-height:1.1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.gov-seats{ font-family:var(--display); font-weight:700; font-size:30px; flex:none; }
+.gov-seats i{ display:block; font-style:normal; font-family:'Oswald',sans-serif; font-size:10px; font-weight:400; color:var(--inksoft); text-align:right; letter-spacing:.5px; }
+.pais-grid{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+.pais-card{ background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:14px; text-align:center; }
+.pais-label{ font-family:'Oswald',sans-serif; font-size:12px; letter-spacing:1px; text-transform:uppercase; color:var(--inksoft); }
+.pais-val{ font-family:var(--display); font-weight:700; font-size:28px; margin-top:4px; }
+.palmares{ display:flex; gap:10px; }
+.palm{ flex:1; background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:12px; display:flex; flex-direction:column; align-items:center; }
+.palm span{ font-size:11px; color:var(--inksoft); font-family:'Oswald',sans-serif; letter-spacing:.5px; }
+.palm b{ font-family:'Oswald',sans-serif; font-size:26px; }
+
+/* turnbar + tabbar */
+.turnbar{ display:flex; align-items:center; gap:10px; padding:10px 14px; background:var(--paper2); border-top:2px solid var(--ink); }
+.turn-info{ display:flex; flex-direction:column; line-height:1.2; }
+.turn-n{ font-family:'Oswald',sans-serif; font-weight:700; font-size:14px; letter-spacing:1px; }
+.turn-el{ font-size:10.5px; color:var(--inksoft); }
+.btn-turn{ margin-left:auto; padding:13px 22px; border:none; color:#fff; font-family:'Oswald',sans-serif; font-weight:600; font-size:15px; letter-spacing:1.5px; cursor:pointer; border-radius:5px; box-shadow:0 3px 0 rgba(0,0,0,.28); }
+.btn-turn:disabled{ opacity:.5; }
+.tabbar{ display:flex; background:var(--ink); }
+.tab{ flex:1; padding:13px 0; background:none; border:none; border-top:3px solid transparent; color:#b9ac93; font-family:'Oswald',sans-serif; font-size:12.5px; letter-spacing:1.5px; text-transform:uppercase; cursor:pointer; }
+.tab.on{ color:var(--paper2); background:#241f18; }
+
+/* overlays */
+.overlay{ position:absolute; inset:0; background:rgba(30,25,18,.55); display:flex; align-items:center; justify-content:center; padding:16px; z-index:40; animation:fade .25s ease; }
+@keyframes fade{ from{opacity:0} to{opacity:1} }
+.sheet{ width:100%; max-height:calc(100% - 20px); overflow-y:auto; background:var(--paper2); border:1.5px solid var(--ink); border-radius:8px; padding:18px; box-shadow:0 14px 34px rgba(0,0,0,.4), inset 0 0 0 5px var(--paper2), inset 0 0 0 6px var(--line); }
+.center-sheet{ text-align:center; }
+.ov-kicker{ font-family:'Oswald',sans-serif; font-size:11px; letter-spacing:2.5px; text-align:center; color:var(--inksoft); }
+.ov-title{ font-family:var(--display); font-weight:700; font-size:30px; text-align:center; line-height:1.05; margin:2px 0 4px; }
+.ov-sub{ text-align:center; font-size:12px; color:var(--inksoft); font-style:italic; margin-bottom:12px; }
+.result-head{ border:2px solid; border-radius:5px; padding:11px; margin:12px 0; background:var(--panelHi); }
+.rh-line{ display:flex; justify-content:space-between; padding:3px 0; font-size:13.5px; }
+.rh-line b{ font-family:'Oswald',sans-serif; }
+.rh-verdict{ margin-top:8px; padding-top:8px; border-top:1px dashed var(--line); text-align:center; font-size:13px; font-weight:600; }
+.rh-verdict.win{ color:var(--green); }
+.ov-btn{ width:100%; margin-top:10px; padding:12px; background:var(--panelHi); border:1.5px solid var(--lineDk); font-family:'Oswald',sans-serif; letter-spacing:1px; font-size:13px; text-transform:uppercase; cursor:pointer; border-radius:5px; color:var(--ink); }
+.ov-btn.primary{ color:#fff; border:none; box-shadow:0 3px 0 rgba(0,0,0,.25); }
+
+/* investiture */
+.vote-btns{ display:flex; gap:8px; margin:12px 0 6px; }
+.vb{ flex:1; padding:14px 0; border:2px solid; font-family:'Oswald',sans-serif; font-weight:600; letter-spacing:1px; font-size:14px; cursor:pointer; border-radius:5px; background:var(--panelHi); }
+.vb.si{ border-color:#3f7a4f; color:#3f7a4f; } .vb.no{ border-color:#b23a2e; color:#b23a2e; } .vb.abs{ border-color:var(--gold); color:var(--gold); font-size:11px; }
+.vote-tally{ display:flex; height:30px; border:1.5px solid var(--ink); border-radius:4px; overflow:hidden; margin:8px 0; }
+.tally-seg{ display:flex; align-items:center; justify-content:center; color:#fff; font-family:'Oswald',sans-serif; font-size:12px; letter-spacing:.5px; min-width:0; }
+.tally-seg.si{ background:#3f7a4f; } .tally-seg.no{ background:#b23a2e; } .tally-seg.abs{ background:#b09a5f; }
+.vote-list{ display:flex; flex-direction:column; gap:2px; margin:6px 0; }
+.vote-row{ display:flex; align-items:center; gap:7px; padding:4px 6px; border-radius:3px; font-size:12.5px; }
+.vote-row.me{ background:var(--panelHi); box-shadow:inset 0 0 0 1.5px var(--lineDk); }
+.vname{ flex:1; font-family:'Oswald',sans-serif; }
+.vseats{ color:var(--inksoft); font-size:11px; width:28px; text-align:right; }
+.vvote{ width:42px; text-align:center; font-family:'Oswald',sans-serif; font-weight:600; font-size:11px; padding:2px 0; border-radius:3px; }
+.vvote.si{ color:#3f7a4f; } .vvote.no{ color:#b23a2e; } .vvote.abs{ color:var(--gold); }
+.inv-verdict{ text-align:center; padding:10px; margin:8px 0; border-radius:5px; font-family:'Oswald',sans-serif; font-size:14px; letter-spacing:.5px; }
+.inv-verdict.ok{ background:#e5eede; color:#2f5a3b; } .inv-verdict.ko{ background:#f0dcd8; color:#8f2a20; }
+
+/* congress + gameover */
+.congress-verdict{ font-family:var(--display); font-weight:700; font-size:34px; letter-spacing:2px; margin:8px 0; }
+.congress-verdict.ok{ color:var(--green); } .congress-verdict.ko{ color:var(--red); }
+.gameover-title{ font-family:var(--display); font-weight:700; font-size:38px; letter-spacing:3px; color:var(--red); margin:4px 0 10px; }
+.final-stats{ display:flex; justify-content:center; gap:18px; margin:14px 0; }
+.final-stats div{ display:flex; flex-direction:column; }
+.final-stats b{ font-family:var(--display); font-size:26px; }
+.final-stats span{ font-size:10px; color:var(--inksoft); letter-spacing:.5px; text-transform:uppercase; }
+
+/* toast */
+.toast{ position:absolute; left:14px; right:14px; bottom:128px; background:var(--ink); color:var(--paper2); padding:11px 14px; border-radius:6px; font-size:12.5px; text-align:center; z-index:30; box-shadow:0 6px 16px rgba(0,0,0,.35); animation:fade .25s ease; }
+
+/* recompte electoral */
+.count-pct{ text-align:center; font-family:var(--display); font-weight:700; font-size:22px; letter-spacing:1px; color:var(--red); margin:2px 0 10px; animation:pulse 1s ease-in-out infinite; }
+@keyframes pulse{ 0%,100%{opacity:1} 50%{opacity:.55} }
+.count-lead{ text-align:center; font-size:13px; margin:10px 0 6px; }
+.count-lead b{ font-family:'Oswald',sans-serif; }
+.reveal-pop{ animation:pop .45s cubic-bezier(.2,1.3,.4,1) both; }
+@keyframes pop{ 0%{ transform:scale(.8); opacity:0 } 100%{ transform:scale(1); opacity:1 } }
+.seatbar-seg{ transition:width .12s linear; }
+.seatchg{ font-family:'Oswald',sans-serif; font-size:11px; font-weight:600; width:34px; text-align:right; flex:none; color:var(--inksoft); }
+.seatchg.u{ color:#3f7a4f; } .seatchg.d{ color:#b23a2e; }
+.seat-n.counting{ color:var(--red); font-variant-numeric:tabular-nums; min-width:38px; text-align:right; }
+
+/* investidura: voltes */
+.round-tag{ text-align:center; font-family:'Oswald',sans-serif; font-size:11.5px; letter-spacing:1px; text-transform:uppercase; background:#efe6cd; border:1px solid var(--line); border-radius:4px; padding:6px; margin:10px 0 8px; }
+.round-tag.r2{ background:#efe0cf; border-color:var(--gold); color:#8a5f1e; }
+.round-note{ font-size:11.5px; line-height:1.5; color:#6b5a3d; background:#f3ecd6; border-left:3px solid var(--gold); padding:7px 10px; border-radius:0 4px 4px 0; margin:8px 0; }
+`;
+
+
+const __root = ReactDOM.createRoot(document.getElementById("root"));
+__root.render(<App />);
+</script>
+</body>
+</html>
