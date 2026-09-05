@@ -141,6 +141,149 @@ function distributeCabinet(parties, votes, playerVote, playerOffer, candKey) {
   return cab;
 }
 
+/* ---- Lleis i pressupostos ---- */
+// 4 conselleries: pressupost 0..10 (neutre 5). Pujar el pressupost millora el seu indicador.
+const CONSELLERIES = [
+  { name: "Economia", ind: "pib", desc: "Impulsa el creixement (PIB)" },
+  { name: "Treball", ind: "atur", desc: "Redueix l'atur" },
+  { name: "Preus i Consum", ind: "inflacio", desc: "Conté la inflació" },
+  { name: "Drets Socials", ind: "benestar", desc: "Apuja el benestar" },
+];
+const SPEND_PER_UNIT = 1.8;
+const spendOf = (budgets) => budgets.reduce((s, b) => s + b, 0) * SPEND_PER_UNIT;
+const SEVREWARD = { ok: 0.2, lleu: 0.8, greu: 1.4, critic: 2.0 };
+
+// inclinació a la despesa pública (0..10): esquerra/verds amunt, capitalistes avall
+function spendPref(ideo) {
+  return clamp((ideo[1] + ideo[6] + (10 - ideo[3]) + (10 - ideo[7])) / 4, 0, 10);
+}
+// vot d'un partit sobre una llei de pressupost (delta>0 = més despesa)
+function lawVoteOf(voter, proposer, delta) {
+  const align = (spendPref(voter.ideo) - 5) * Math.sign(delta); // li agrada la direcció?
+  const rel = relationScore(proposer.ideo, voter.ideo);          // 0..100
+  const score = align * 0.85 + (rel - 45) / 12 + gauss(0, 0.8);
+  return score > 1.2 ? "SÍ" : score > -0.6 ? "ABS" : "NO";
+}
+function weightedPick(arr, wf) {
+  const tot = arr.reduce((s, x) => s + wf(x), 0);
+  let r = Math.random() * tot;
+  for (const x of arr) { r -= wf(x); if (r <= 0) return x; }
+  return arr[arr.length - 1];
+}
+
+/* ---- Debats (joc de cartes) ---- */
+const dn = (d, i) => d.parts[i].name;
+const DEBATE_CARDS = [
+  { id: "argument", name: "Argument", icon: "💬", effect: "+1", weight: 18, apply: (d, p) => { d.roundPts[p] += 1; return { log: `${dn(d, p)} fa un argument sòlid`, deltas: [{ p, val: 1 }] }; } },
+  { id: "argument_solid", name: "Argument Sòlid", icon: "🏅", effect: "+3", weight: 2, apply: (d, p) => { d.roundPts[p] += 3; return { log: `${dn(d, p)} clava un ARGUMENT SÒLID! (+3)`, deltas: [{ p, val: 3 }] }; } },
+  { id: "populisme", name: "Populisme", icon: "📢", effect: "+2", weight: 12, apply: (d, p) => { d.roundPts[p] += 2; return { log: `${dn(d, p)} fa populisme`, deltas: [{ p, val: 2 }] }; } },
+  { id: "mentida", name: "Mentida", icon: "🤥", effect: "±2 (50/50)", weight: 10, apply: (d, p) => { const w = Math.random() < 0.5; const v = w ? 2 : -2; d.roundPts[p] += v; return { log: `${dn(d, p)} menteix i ${w ? "se'n surt" : "és enxampat"}`, deltas: [{ p, val: v }], chance: { win: w, val: v } }; } },
+  { id: "atac", name: "Atac", icon: "⚡", effect: "-1 rival / -1 tu", weight: 12, target: true, apply: (d, p, t) => { if (d.esquiva[t]) { d.esquiva[t] = false; d.roundPts[p] -= 1; return { log: `${dn(d, p)} ataca però ${dn(d, t)} s'esquiva!`, deltas: [{ p, val: -1 }] }; } d.roundPts[p] -= 1; d.roundPts[t] -= 1; return { log: `${dn(d, p)} ataca ${dn(d, t)}`, deltas: [{ p, val: -1 }, { p: t, val: -1 }] }; } },
+  { id: "atac_dur", name: "Atac Contundent", icon: "💥", effect: "-2 rival / -2 tu", weight: 6, target: true, apply: (d, p, t) => { if (d.esquiva[t]) { d.esquiva[t] = false; d.roundPts[p] -= 2; return { log: `${dn(d, p)} ataca fort però ${dn(d, t)} s'esquiva!`, deltas: [{ p, val: -2 }] }; } d.roundPts[p] -= 2; d.roundPts[t] -= 2; return { log: `${dn(d, p)} ataca contundentment ${dn(d, t)}`, deltas: [{ p, val: -2 }, { p: t, val: -2 }] }; } },
+  { id: "esquiva", name: "Esquiva", icon: "🛡️", effect: "Anul·la el pròxim atac", weight: 10, apply: (d, p) => { d.esquiva[p] = true; return { log: `${dn(d, p)} activa l'esquiva`, deltas: [] }; } },
+  { id: "alianca", name: "Aliança", icon: "🤝", effect: "+1 tu / +1 rival", weight: 8, target: true, apply: (d, p, t) => { d.roundPts[p] += 1; d.roundPts[t] += 1; return { log: `${dn(d, p)} pacta amb ${dn(d, t)}`, deltas: [{ p, val: 1 }, { p: t, val: 1 }] }; } },
+  { id: "escandol", name: "Escàndol", icon: "📰", effect: "-3 rival / 50% -1 tu", weight: 6, target: true, apply: (d, p, t) => { const deltas = []; if (d.esquiva[t]) { d.esquiva[t] = false; let sp = false; if (Math.random() < 0.5) { d.roundPts[p] -= 1; deltas.push({ p, val: -1 }); sp = true; } return { log: `${dn(d, p)} llança un escàndol però ${dn(d, t)} s'esquiva!`, deltas, chance: sp ? { win: false, val: -1, splash: true } : undefined }; } d.roundPts[t] -= 3; deltas.push({ p: t, val: -3 }); const sh = Math.random() < 0.5; if (sh) { d.roundPts[p] -= 1; deltas.push({ p, val: -1 }); } return { log: `${dn(d, p)} desvela un escàndol de ${dn(d, t)}${sh ? " i l'esquitxa" : ""}`, deltas, chance: sh ? { win: false, val: -1, splash: true } : undefined }; } },
+  { id: "proposta", name: "Proposta Estrella", icon: "⭐", effect: "+3 / exposat", weight: 5, apply: (d, p) => { d.roundPts[p] += 3; d.noAttackNext[p] = true; return { log: `${dn(d, p)} presenta la Proposta Estrella`, deltas: [{ p, val: 3 }] }; } },
+  { id: "gir", name: "Gir Mediàtic", icon: "📺", effect: "Intercanvia punts", weight: 7, target: true, apply: (d, p, t) => { const tmp = d.roundPts[p]; const diff = d.roundPts[t] - d.roundPts[p]; d.roundPts[p] = d.roundPts[t]; d.roundPts[t] = tmp; return { log: `${dn(d, p)} fa un Gir Mediàtic amb ${dn(d, t)}`, deltas: [{ p, val: diff }, { p: t, val: -diff }] }; } },
+  { id: "moderador", name: "Moderador", icon: "🎙️", effect: "Torn a zero", weight: 6, apply: (d, p) => { d.moderadorUsed = true; return { log: `${dn(d, p)} crida el Moderador!`, deltas: [] }; } },
+];
+const debDef = (id) => DEBATE_CARDS.find((c) => c.id === id);
+function debDeck() { const a = []; for (const c of DEBATE_CARDS) for (let i = 0; i < c.weight; i++) a.push(c.id); return a; }
+const debDraw = (deck) => deck[Math.floor(Math.random() * deck.length)];
+const shuffle = (a) => { const r = [...a]; for (let i = r.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [r[i], r[j]] = [r[j], r[i]]; } return r; };
+const ATTACKS = ["atac", "atac_dur", "escandol"];
+
+function makeDebate(parts) {
+  const deck = debDeck(); const np = parts.length;
+  return {
+    parts, np, deck,
+    hands: parts.map(() => [debDraw(deck), debDraw(deck), debDraw(deck)]),
+    roundPts: parts.map(() => 0), total: parts.map(() => 0), roundsWon: parts.map(() => 0),
+    esquiva: parts.map(() => false), noAttackNext: parts.map(() => false), noAttackThisTurn: parts.map(() => false),
+    moderadorUsed: false, round: 1, turn: 1,
+    order: shuffle([...Array(np).keys()]), cursor: 0, plays: [], pending: [], log: ["El debat comença."], phase: "turn",
+  };
+}
+function cloneDebate(d) {
+  return { ...d, hands: d.hands.map((h) => [...h]), roundPts: [...d.roundPts], total: [...d.total], roundsWon: [...d.roundsWon], esquiva: [...d.esquiva], noAttackNext: [...d.noAttackNext], noAttackThisTurn: [...d.noAttackThisTurn], order: [...d.order], plays: [...d.plays], pending: [...d.pending], log: [...d.log] };
+}
+function debApplyPlay(d, pid, idx, cardId, tid) {
+  const res = debDef(cardId).apply(d, pid, tid);
+  d.plays.push({ pid, cardId, tid, res });
+  d.log.push(res.log);
+  const meIdx = d.parts.findIndex((p) => p.isPlayer);
+  // finestra: t'han atacat (i ha impactat)
+  if (ATTACKS.includes(cardId) && tid === meIdx && pid !== meIdx) {
+    const dmg = res.deltas.filter((x) => x.p === meIdx).reduce((s, x) => s + x.val, 0);
+    if (dmg < 0) d.pending.push({ kind: "attack", attacker: pid, cardId, dmg });
+  }
+  // finestra: resultat d'atzar d'una carta teva (Mentida / Escàndol que t'esquitxa)
+  if (pid === meIdx && res.chance) d.pending.push({ kind: "chance", cardId, ...res.chance });
+  const h = [...d.hands[pid]]; h[idx] = debDraw(d.deck); d.hands[pid] = h;
+}
+function debAiChoose(d, pid) {
+  let avail = d.hands[pid].map((c, i) => ({ c, i }));
+  if (d.noAttackThisTurn[pid]) { const f = avail.filter((x) => !ATTACKS.includes(x.c)); if (f.length) avail = f; }
+  const pick = avail[Math.floor(Math.random() * avail.length)];
+  const def = debDef(pick.c);
+  let tid = null;
+  if (def.target) {
+    const others = [...Array(d.np).keys()].filter((i) => i !== pid);
+    if (ATTACKS.includes(pick.c)) tid = others.reduce((b, i) => (d.total[i] + d.roundPts[i]) > (d.total[b] + d.roundPts[b]) ? i : b, others[0]);
+    else tid = others[Math.floor(Math.random() * others.length)];
+  }
+  return { cardId: pick.c, idx: pick.i, tid };
+}
+// resol IA fins que toca al jugador o s'acaba el torn
+function debStepAIs(d) {
+  while (d.cursor < d.np) {
+    const pid = d.order[d.cursor];
+    if (d.parts[pid].isPlayer) return;
+    const ch = debAiChoose(d, pid);
+    debApplyPlay(d, pid, ch.idx, ch.cardId, ch.tid);
+    d.cursor++;
+  }
+  debEndTurn(d);
+}
+function debPlayerPlay(d, idx, cardId, tid) {
+  debApplyPlay(d, d.order[d.cursor], idx, cardId, tid);
+  d.cursor++;
+  debStepAIs(d);
+}
+function debEndTurn(d) {
+  if (d.moderadorUsed) { for (let i = 0; i < d.np; i++) d.roundPts[i] = 0; d.moderadorUsed = false; d.log.push("El Moderador ho reinicia tot aquest torn."); }
+  d.phase = "turnend";
+}
+function debNoAtkTransition(d) { for (let i = 0; i < d.np; i++) { d.noAttackThisTurn[i] = d.noAttackNext[i]; d.noAttackNext[i] = false; } }
+function debNextTurn(d) {
+  d.plays = []; debNoAtkTransition(d);
+  if (d.turn < 3) { d.turn++; d.order = shuffle([...Array(d.np).keys()]); d.cursor = 0; d.phase = "turn"; debStepAIs(d); }
+  else debResolveRound(d);
+}
+function debResolveRound(d) {
+  for (let i = 0; i < d.np; i++) d.total[i] += d.roundPts[i];
+  let max = -Infinity, wIdx = -1, tie = false;
+  for (let i = 0; i < d.np; i++) { if (d.roundPts[i] > max) { max = d.roundPts[i]; wIdx = i; tie = false; } else if (d.roundPts[i] === max) tie = true; }
+  d.roundMsg = tie ? `Empat a la ronda ${d.round}. Ningú la guanya.` : `${d.parts[wIdx].name} guanya la ronda ${d.round} (${max} punts).`;
+  if (!tie) d.roundsWon[wIdx]++;
+  for (let i = 0; i < d.np; i++) { d.roundPts[i] = 0; d.esquiva[i] = false; }
+  if (d.roundsWon.some((w) => w >= 2) || d.round >= 3) debFinish(d);
+  else { d.round++; d.turn = 1; d.phase = "roundend"; }
+}
+function debContinueRound(d) {
+  d.plays = []; debNoAtkTransition(d);
+  d.order = shuffle([...Array(d.np).keys()]); d.cursor = 0; d.phase = "turn"; debStepAIs(d);
+}
+function debFinish(d) {
+  d.phase = "over";
+  // rendiment = rondes guanyades (pes) + punts totals. Escala fixa: només marges grans arriben a ±4.
+  const perf = d.parts.map((_, i) => d.roundsWon[i] * 4 + d.total[i]);
+  const mean = perf.reduce((a, b) => a + b, 0) / d.np;
+  d.voteChanges = d.parts.map((p, i) => ({ key: p.key, change: round1(clamp((perf[i] - mean) * 0.4, -4, 4)) }));
+  d.ranking = d.parts.map((p, i) => ({ ...p, total: d.total[i], rw: d.roundsWon[i] })).sort((a, b) => b.rw - a.rw || b.total - a.total);
+}
+function startDebateState(parts) { const d = makeDebate(parts); debStepAIs(d); return d; }
+
 function normalizeVotes(parties) {
   const t = parties.reduce((s, p) => s + p.vote, 0) || 1;
   parties.forEach((p) => (p.vote = (p.vote / t) * 100));
@@ -239,6 +382,7 @@ function makeGame(mode, name, color, ideo, existingKey, startVote) {
     pais: { pib: 2.1, inflacio: 3.0, atur: 9.5, benestar: 60 },
     taxes: 40,
     income: computeIncome(40, 2.1),
+    budgets: [5, 5, 5, 5],
     paisHistory: [{ turn: 0, pib: 2.1, inflacio: 3.0, atur: 9.5, benestar: 60, taxes: 40, income: computeIncome(40, 2.1) }],
     cabinet: null,
     electionsWon: 0,
@@ -269,6 +413,10 @@ function App() {
   const [congress, setCongress] = useState(null);
   const [gameover, setGameover] = useState(null);
   const [turnSummary, setTurnSummary] = useState(null);
+  const [pendingLaw, setPendingLaw] = useState(null);
+  const [lawPhase, setLawPhase] = useState("vote");
+  const [debateParts, setDebateParts] = useState(null);
+  const [debateOffer, setDebateOffer] = useState(null);
   const [toast, setToast] = useState(null);
   const [rules, setRules] = useState(false);
 
@@ -363,19 +511,23 @@ function App() {
     const np = parties.find((p) => p.isPlayer);
     const approval = calcApproval(np.ideo, prev.approvedIdeo, np.vote, prev.baselineVote, gauss(0, 3));
 
-    // 4) Indicadors de país: soroll + govern + IMPOSTOS
+    // 4) Indicadors de país: soroll + govern + IMPOSTOS + CONSELLERIES + DÈFICIT
     const gov = prev.president ? byKey(prev, prev.president) : null;
     const govEcon = gov ? gov.ideo[7] : 5;         // eix ECONOMIA del govern
     const taxDev = (prev.taxes - NEUTRAL_TAX) / 100; // -0.4 .. +0.6
+    const b = prev.budgets;                          // [Economia, Treball, Preus, Social]
+    const balancePrev = prev.income - spendOf(b);    // >0 superàvit, <0 dèficit
+    const defic = Math.max(0, -balancePrev);
+    const surpl = Math.max(0, balancePrev);
+    let pib = prev.pais.pib + gauss(0, 0.35) + (govEcon - 5) * 0.03 - taxDev * 0.9 + (b[0] - 5) * 0.07;
+    let inflacio = prev.pais.inflacio + gauss(0, 0.25) - taxDev * 0.7 - (b[2] - 5) * 0.10 + defic * 0.015;
+    let atur = prev.pais.atur + gauss(0, 0.3) - (prev.pais.pib - 2) * 0.1 + taxDev * 1.2 - (b[1] - 5) * 0.22;
+    let benestar = prev.pais.benestar + gauss(0, 1.4) + (prev.pais.pib - 2) * 0.6 - (prev.pais.inflacio - 3) * 0.5 + taxDev * 2.2 + (b[3] - 5) * 0.7 - defic * 0.03 + surpl * 0.01;
     const pais = {
-      // impostos alts frenen el creixement; baixos l'estimulen
-      pib: round1(clamp(prev.pais.pib + gauss(0, 0.35) + (govEcon - 5) * 0.03 - taxDev * 0.9, -4, 6)),
-      // impostos alts refreden la inflació
-      inflacio: round1(clamp(prev.pais.inflacio + gauss(0, 0.25) - taxDev * 0.7, 0, 12)),
-      // impostos alts pugen l'atur; el creixement el baixa
-      atur: round1(clamp(prev.pais.atur + gauss(0, 0.3) - (prev.pais.pib - 2) * 0.1 + taxDev * 1.2, 3, 26)),
-      // impostos alts financen més benestar; la inflació i la recessió el desgasten
-      benestar: Math.round(clamp(prev.pais.benestar + gauss(0, 1.4) + (prev.pais.pib - 2) * 0.6 - (prev.pais.inflacio - 3) * 0.5 + taxDev * 2.2, 0, 100)),
+      pib: round1(clamp(pib, -4, 6)),
+      inflacio: round1(clamp(inflacio, 0, 12)),
+      atur: round1(clamp(atur, 3, 26)),
+      benestar: Math.round(clamp(benestar, 0, 100)),
     };
     const income = computeIncome(prev.taxes, pais.pib);
     const paisHistory = [...prev.paisHistory, { turn: t, ...pais, taxes: prev.taxes, income }].slice(-80);
@@ -406,10 +558,151 @@ function App() {
       return;
     }
 
-    // torn normal → finestra de resum (variació de vot i diputats)
+    // torn normal → potser un partit proposa una llei o un debat; si no, resum del torn
+    if (prev.lastElection && Math.random() < 0.15) {
+      const law = makeAiLaw(next);
+      if (law) { setG(next); setPendingLaw(law); setLawPhase("vote"); setOverlay("law"); return; }
+    }
+    if (prev.lastElection && Math.random() < 0.10) {
+      const k = offerDebateFromAI(next);
+      if (k) { setG(next); setDebateOffer(k); setOverlay("debateoffer"); return; }
+    }
     setG(next);
     setTurnSummary({ turn: t, poll: [...poll].sort((a, b) => b.vote - a.vote), parties: next.parties });
     setOverlay("turnsummary");
+  }
+
+  function makeAiLaw(gg) {
+    const cands = gg.parties.filter((p) => !p.isPlayer && gg.lastElection.catalonia[p.key] > 0);
+    if (!cands.length) return null;
+    const proposer = weightedPick(cands, (p) => gg.lastElection.catalonia[p.key]);
+    const sp = spendPref(proposer.ideo);
+    const bud = gg.budgets;
+    let cons, dir;
+    if (sp >= 5) {
+      // pro-despesa: apuja la conselleria de l'indicador més tocat
+      const worst = CONSELLERIES.map((c, i) => ({ i, r: SEVMETA[SEV[c.ind](gg.pais[c.ind])].r })).sort((a, b) => b.r - a.r)[0];
+      cons = worst.i; dir = +1;
+    } else {
+      // anti-despesa: retalla la conselleria amb més pressupost
+      cons = bud.indexOf(Math.max(...bud)); dir = -1;
+    }
+    const from = bud[cons];
+    const to = clamp(from + dir * (1 + Math.floor(Math.random() * 2)), 0, 10);
+    if (to === from) return null;
+    return { proposer: proposer.key, cons, from, to, route: "parlament" };
+  }
+
+  /* ------------------------------ Lleis --------------------------------- */
+  function resolveLaw(gg, law, playerVote) {
+    const proposer = byKey(gg, law.proposer);
+    const delta = law.to - law.from;
+    const useCabinet = law.route === "decret";
+    const weightOf = (p) => (useCabinet ? (gg.cabinet ? gg.cabinet[p.key] || 0 : 0) : gg.lastElection.catalonia[p.key]);
+    const voters = gg.parties.filter((p) => weightOf(p) > 0 || p.key === law.proposer);
+    const votes = voters.map((p) => {
+      let vote;
+      if (p.key === law.proposer) vote = "SÍ";
+      else if (p.isPlayer && playerVote) vote = playerVote;
+      else vote = lawVoteOf(p, proposer, delta);
+      return { key: p.key, vote, w: weightOf(p) };
+    });
+    const si = votes.filter((v) => v.vote === "SÍ").reduce((s, v) => s + v.w, 0);
+    const no = votes.filter((v) => v.vote === "NO").reduce((s, v) => s + v.w, 0);
+    const abs = votes.filter((v) => v.vote === "ABS").reduce((s, v) => s + v.w, 0);
+    return { votes, si, no, abs, pass: si > no, useCabinet };
+  }
+
+  function playerInGov(gg) {
+    return gg.president === "PLAYER" || (gg.cabinet && (gg.cabinet.PLAYER || 0) > 0);
+  }
+
+  // proposta iniciada pel jugador
+  function proposeBudget(cons, to, route) {
+    if (!g) return;
+    const cost = route === "decret" ? 20 : 10;
+    if (g.cp < cost) return;
+    const law = { proposer: "PLAYER", cons, from: g.budgets[cons], to, route };
+    const result = resolveLaw(g, law, null);
+    // recompensa de vots si el jugador és oposició i la llei millora un indicador en crisi
+    let reward = 0;
+    if (result.pass && !playerInGov(g) && to > g.budgets[cons]) {
+      const ind = CONSELLERIES[cons].ind;
+      reward = SEVREWARD[SEV[ind](g.pais[ind])];
+    }
+    setG((prev) => ({ ...prev, cp: prev.cp - cost }));
+    setPendingLaw({ ...law, result: { ...result, reward } });
+    setLawPhase("reveal");
+    setOverlay("law");
+  }
+
+  // el jugador vota una llei proposada per un altre partit
+  function castLawVote(playerVote) {
+    const result = resolveLaw(g, pendingLaw, playerVote);
+    setPendingLaw({ ...pendingLaw, playerVote, result: { ...result, reward: 0 } });
+    setLawPhase("reveal");
+  }
+
+  function closeLaw() {
+    const law = pendingLaw;
+    if (law && law.result && law.result.pass) {
+      setG((prev) => {
+        const budgets = [...prev.budgets];
+        budgets[law.cons] = law.to;
+        let parties = prev.parties;
+        if (law.proposer === "PLAYER" && law.result.reward > 0) {
+          parties = prev.parties.map((p) => (p.isPlayer ? { ...p, vote: p.vote + law.result.reward, base: p.base + law.result.reward } : p));
+          normalizeVotes(parties);
+        }
+        return { ...prev, budgets, parties };
+      });
+    }
+    setOverlay(null); setPendingLaw(null);
+  }
+
+  /* ------------------------------ Debats -------------------------------- */
+  function partOf(gg, key) { const p = byKey(gg, key); return { key: p.key, name: p.name, color: p.color, isPlayer: !!p.isPlayer }; }
+
+  function beginDebate(parts) { setDebateParts(parts); setOverlay("debate"); }
+
+  function convokeDebate(keys) {
+    if (!g || g.cp < 15 || !keys.length || keys.length > 5) return;
+    const me = player(g);
+    const meSeats = g.lastElection ? g.lastElection.catalonia.PLAYER : me.vote;
+    const accepted = [], declined = [];
+    keys.forEach((k) => {
+      const seatsT = g.lastElection ? g.lastElection.catalonia[k] : byKey(g, k).vote;
+      const rel = relationScore(me.ideo, byKey(g, k).ideo);
+      const prob = clamp(0.5 + (meSeats - seatsT) / 40 + (rel - 45) / 300, 0.08, 0.92);
+      (Math.random() < prob ? accepted : declined).push(k);
+    });
+    if (!accepted.length) { setToast("Cap partit accepta el debat. No gastes CP."); return; }
+    setG((prev) => ({ ...prev, cp: prev.cp - 15 }));
+    if (declined.length) setToast(`Declinen el debat: ${declined.map((k) => byKey(g, k).name).join(", ")}`);
+    beginDebate([partOf(g, "PLAYER"), ...accepted.map((k) => partOf(g, k))]);
+  }
+
+  function offerDebateFromAI(gg) {
+    const cands = gg.parties.filter((p) => !p.isPlayer && (gg.lastElection ? gg.lastElection.catalonia[p.key] > 0 : true));
+    if (!cands.length) return null;
+    return weightedPick(cands, (p) => (gg.lastElection ? gg.lastElection.catalonia[p.key] : p.vote)).key;
+  }
+  function acceptDebateOffer() {
+    const k = debateOffer; setDebateOffer(null);
+    beginDebate([partOf(g, "PLAYER"), partOf(g, k)]);
+  }
+  function declineDebateOffer() { setOverlay(null); setDebateOffer(null); }
+
+  function finishDebate(voteChanges) {
+    setG((prev) => {
+      const parties = prev.parties.map((p) => {
+        const ch = voteChanges.find((c) => c.key === p.key);
+        return ch ? { ...p, vote: Math.max(0.5, p.vote + ch.change), base: Math.max(0.5, p.base + ch.change) } : p;
+      });
+      normalizeVotes(parties);
+      return { ...prev, parties };
+    });
+    setOverlay(null); setDebateParts(null);
   }
 
   /* ------------------------------ Congrés (resolució) ------------------- */
@@ -555,7 +848,7 @@ function App() {
 
   function restart() {
     setScreen("setup"); setOverlay(null); setG(null);
-    setElection(null); setInv(null); setCongress(null); setGameover(null); setTurnSummary(null);
+    setElection(null); setInv(null); setCongress(null); setGameover(null); setTurnSummary(null); setPendingLaw(null); setDebateParts(null); setDebateOffer(null);
     setMode("custom"); setPname(""); setPcolor(PLAYER_COLORS[0]);
     setPideo([5,5,5,5,5,5,5,5,5,5]); setExisting(null); setTab("partit"); setPvoteStart(3);
   }
@@ -569,7 +862,7 @@ function App() {
           <Setup {...{ mode, setMode, pname, setPname, pcolor, setPcolor, pideo, setPideo, pvoteStart, setPvoteStart, existing, setExisting, start, rules, setRules }} />
         ) : (
           <Game
-            {...{ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, setTaxes, overlay, rules, setRules }}
+            {...{ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, setTaxes, proposeBudget, convokeDebate, overlay, rules, setRules }}
           />
         )}
 
@@ -579,6 +872,15 @@ function App() {
         )}
         {overlay === "investiture" && inv && (
           <InvestitureOverlay g={g} inv={inv} onCast={castInvestiture} onAuto={autoInvestiturePlayerCandidate} onRound2={toRound2} onNext={nextInvestitureStep} />
+        )}
+        {overlay === "law" && pendingLaw && (
+          <LawOverlay g={g} law={pendingLaw} phase={lawPhase} onVote={castLawVote} onClose={closeLaw} />
+        )}
+        {overlay === "debate" && debateParts && (
+          <DebateOverlay parts={debateParts} onFinish={finishDebate} onClose={() => { setOverlay(null); setDebateParts(null); }} />
+        )}
+        {overlay === "debateoffer" && debateOffer && (
+          <DebateOfferOverlay g={g} proposerKey={debateOffer} onAccept={acceptDebateOffer} onDecline={declineDebateOffer} />
         )}
         {overlay === "turnsummary" && turnSummary && (
           <TurnSummaryOverlay g={g} ts={turnSummary} onClose={() => { setOverlay(null); setTurnSummary(null); }} />
@@ -696,16 +998,16 @@ function RulesText() {
 
 /* -------------------------------- GAME ----------------------------------- */
 
-function Game({ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, setTaxes, overlay, rules, setRules }) {
+function Game({ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, setTaxes, proposeBudget, convokeDebate, overlay, rules, setRules }) {
   const p = player(g);
   const untilElection = Math.max(0, g.nextElectionAt - g.turn);
   return (
     <>
       <TopBar g={g} />
       <div className="content">
-        {tab === "partit" && <TabPartit g={g} adjustIdeo={adjustIdeo} convokeCongress={convokeCongress} rules={rules} setRules={setRules} />}
+        {tab === "partit" && <TabPartit g={g} adjustIdeo={adjustIdeo} convokeCongress={convokeCongress} convokeDebate={convokeDebate} rules={rules} setRules={setRules} />}
         {tab === "resultats" && <TabResultats g={g} />}
-        {tab === "pais" && <TabPais g={g} setTaxes={setTaxes} />}
+        {tab === "pais" && <TabPais g={g} setTaxes={setTaxes} proposeBudget={proposeBudget} />}
       </div>
 
       <div className="turnbar">
@@ -750,7 +1052,7 @@ function TopBar({ g }) {
 }
 
 /* ---- Tab PARTIT ---- */
-function TabPartit({ g, adjustIdeo, convokeCongress, rules, setRules }) {
+function TabPartit({ g, adjustIdeo, convokeCongress, convokeDebate, rules, setRules }) {
   const p = player(g);
   const drift = ideoPenalty(p.ideo, g.approvedIdeo);
   const congressReady = g.congressCooldown === 0 && !g.congressPending;
@@ -798,6 +1100,9 @@ function TabPartit({ g, adjustIdeo, convokeCongress, rules, setRules }) {
         })}
       </div>
       <p className="muted xsmall">Com més a prop ideològicament (ponderant molt nacionalisme, independentisme i immigració), més fàcil que t'investeixin o s'abstinguin.</p>
+
+      <SectionTitle>Debats</SectionTitle>
+      <DebateSetup g={g} convokeDebate={convokeDebate} />
 
       <SectionTitle>Congrés del partit</SectionTitle>
       <div className="congress-box">
@@ -952,8 +1257,13 @@ function Cabinet({ g }) {
   );
 }
 
-function TabPais({ g, setTaxes }) {
+function TabPais({ g, setTaxes, proposeBudget }) {
   const [openInd, setOpenInd] = useState(null);
+  const [draft, setDraft] = useState(g.budgets);
+  useEffect(() => { setDraft(g.budgets); }, [g.budgets]);
+  const inGov = g.president === "PLAYER" || (g.cabinet && (g.cabinet.PLAYER || 0) > 0);
+  const spending = Math.round(spendOf(g.budgets));
+  const balance = Math.round(g.income - spendOf(g.budgets));
   const prevP = g.paisHistory.length > 1 ? g.paisHistory[g.paisHistory.length - 2] : null;
   const items = [
     { k: "pib", label: "PIB", suf: "%", val: g.pais.pib.toFixed(1), num: g.pais.pib },
@@ -966,6 +1276,7 @@ function TabPais({ g, setTaxes }) {
 
   return (
     <div className="pad">
+      {/* 1 · Govern i gabinet */}
       <SectionTitle>Govern i gabinet</SectionTitle>
       {gov ? (
         <div className="gov-banner" style={{ borderColor: gov.color }}>
@@ -986,48 +1297,33 @@ function TabPais({ g, setTaxes }) {
       )}
       <Cabinet g={g} />
 
-      <SectionTitle>Impostos i ingressos</SectionTitle>
-      <div className="tax-box">
-        <div className="tax-head">
-          <span>Pressió fiscal</span>
-          <b className="tax-val">{g.taxes}%</b>
-        </div>
-        <input className="tax-range" type="range" min={0} max={100} step={5} value={g.taxes}
-          onChange={(e) => setTaxes(+e.target.value)} />
-        <div className="tax-foot">
-          <span>Ingressos de l'Estat</span><b style={{ color: "var(--green)" }}>{g.income}</b>
-        </div>
-        <p className="muted xsmall">Apujar impostos apuja ingressos i benestar, però frena el PIB i apuja l'atur (tot i que refreda la inflació). Abaixar-los fa el contrari.</p>
-      </div>
-
+      {/* 2 · Situació del país (compacta) */}
       <SectionTitle>Situació del país</SectionTitle>
       {crises.length > 0 ? (
-        <div className="crisis-box">
-          <span className="crisis-h">⚠ {crises.length === 1 ? "Crisi activa" : "Crisis actives"}</span>
+        <div className="crisis-box compact">
+          <span className="crisis-h">⚠ {crises.length === 1 ? "Crisi" : "Crisis"}</span>
           {crises.map(({ it, sev }) => (
             <span className="crisis-item" key={it.k} style={{ color: SEVMETA[sev].c }}>{it.label}: {SEVMETA[sev].t}</span>
           ))}
         </div>
       ) : (
-        <div className="crisis-box ok"><span className="crisis-h" style={{ color: "var(--green)" }}>✓ Sense crisis · país estable</span></div>
+        <div className="crisis-box ok compact"><span className="crisis-h" style={{ color: "var(--green)" }}>✓ Sense crisis · país estable</span></div>
       )}
-
-      <div className="pais-grid">
+      <div className="pais-grid compact">
         {items.map((it) => {
           const sev = SEV[it.k](it.num);
           const meta = SEVMETA[sev];
           const d = prevP ? it.num - prevP[it.k] : 0;
-          const higherBetter = IND_HIGHER_BETTER[it.k];
-          const goodDir = (d > 0) === higherBetter;
+          const goodDir = (d > 0) === IND_HIGHER_BETTER[it.k];
           const up = Math.abs(d) >= (it.k === "benestar" ? 1 : 0.05);
           return (
-            <div className={"pais-card clickable " + (openInd === it.k ? "open" : "")} key={it.k} onClick={() => setOpenInd(openInd === it.k ? null : it.k)}>
+            <div className={"pais-card sm clickable " + (openInd === it.k ? "open" : "")} key={it.k} onClick={() => setOpenInd(openInd === it.k ? null : it.k)}>
               <div className="pais-label">{it.label} <span className="pais-caret">{openInd === it.k ? "▾" : "▸"}</span></div>
-              <div className="pais-val" style={{ color: meta.c }}>{it.val}<span className="pais-suf">{it.suf}</span></div>
-              <div className="pais-meta">
-                <span className="sev-tag" style={{ background: meta.c }}>{meta.t}</span>
+              <div className="pais-row">
+                <span className="pais-val sm" style={{ color: meta.c }}>{it.val}<span className="pais-suf">{it.suf}</span></span>
                 {up && <span className="pais-delta" style={{ color: goodDir ? "#3f7a4f" : "#b23a2e" }}>{d > 0 ? "▲" : "▼"}{Math.abs(d).toFixed(it.k === "benestar" ? 0 : 1)}</span>}
               </div>
+              <span className="sev-tag" style={{ background: meta.c }}>{meta.t}</span>
             </div>
           );
         })}
@@ -1039,10 +1335,62 @@ function TabPais({ g, setTaxes }) {
         </div>
       )}
 
-      <SectionTitle>Palmarès</SectionTitle>
-      <div className="palmares">
-        <div className="palm"><span>Eleccions guanyades</span><b>{g.electionsWon}</b></div>
-        <div className="palm"><span>Presidències</span><b>{g.presidencies}</b></div>
+      {/* 3 · Conselleries i pressupost */}
+      <SectionTitle>Conselleries i pressupost</SectionTitle>
+      <div className="budget-summary">
+        <span>Ingressos <b style={{ color: "var(--green)" }}>{g.income}</b></span>
+        <span>Despeses <b>{spending}</b></span>
+        <span>Balanç <b style={{ color: balance >= 0 ? "var(--green)" : "var(--red)" }}>{balance >= 0 ? "+" + balance : balance}</b> <i>{balance >= 0 ? "superàvit" : "dèficit"}</i></span>
+      </div>
+      {balance < 0 && <p className="muted xsmall" style={{ color: "var(--red)" }}>El dèficit apuja la inflació i erosiona el benestar. Abaixa despeses o apuja impostos (o el PIB).</p>}
+      <div className="cons-list">
+        {CONSELLERIES.map((c, i) => {
+          const cur = g.budgets[i], dr = draft[i], changed = dr !== cur;
+          return (
+            <div className={"cons-row " + (changed ? "changed" : "")} key={c.name}>
+              <div className="cons-head">
+                <span className="cons-name">{c.name}</span>
+                <span className="cons-desc">{c.desc}</span>
+              </div>
+              <div className="cons-ctrl">
+                <button className="step" onClick={() => setDraft(draft.map((v, j) => j === i ? Math.max(0, v - 1) : v))} disabled={dr <= 0}>–</button>
+                <div className="cons-bar">
+                  <div className="cons-fill" style={{ width: cur * 10 + "%" }} />
+                  {changed && <div className="cons-ghost" style={{ width: dr * 10 + "%" }} />}
+                </div>
+                <button className="step" onClick={() => setDraft(draft.map((v, j) => j === i ? Math.min(10, v + 1) : v))} disabled={dr >= 10}>+</button>
+                <span className="cons-num">{dr}{changed && <i>← {cur}</i>}</span>
+              </div>
+              {changed && (
+                <div className="cons-actions">
+                  {inGov ? (
+                    <>
+                      <button className="law-btn" disabled={g.cp < 10} onClick={() => proposeBudget(i, dr, "parlament")}>Llei · Parlament <b>10 CP</b></button>
+                      <button className="law-btn decret" disabled={g.cp < 20} onClick={() => proposeBudget(i, dr, "decret")}>Decret · Gabinet <b>20 CP</b></button>
+                    </>
+                  ) : (
+                    <button className="law-btn" disabled={g.cp < 10} onClick={() => proposeBudget(i, dr, "parlament")}>Proposar llei al Parlament <b>10 CP</b></button>
+                  )}
+                  <button className="cons-cancel" onClick={() => setDraft(draft.map((v, j) => j === i ? cur : v))}>Cancel·la</button>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <p className="muted xsmall">{inGov ? "Al govern: aprova per Parlament (barat, però han de votar-hi els partits) o per Decret al gabinet (car, però fiable)." : "A l'oposició: proposa lleis al Parlament. Si s'aproven i milloren un indicador en crisi, guanyes vots."}</p>
+
+      {/* 4 · Impostos i ingressos (compacta) */}
+      <SectionTitle>Impostos i ingressos</SectionTitle>
+      <div className="tax-box compact">
+        <div className="tax-line">
+          <span>Pressió fiscal</span>
+          <b className="tax-val">{g.taxes}%</b>
+          <span className="tax-inc">Ingressos <b style={{ color: "var(--green)" }}>{g.income}</b></span>
+        </div>
+        <input className="tax-range" type="range" min={0} max={100} step={5} value={g.taxes}
+          onChange={(e) => setTaxes(+e.target.value)} />
+        <p className="muted xsmall">+ impostos = + ingressos i benestar, però − PIB i + atur (i − inflació). Abaixar-los fa el contrari.</p>
       </div>
     </div>
   );
@@ -1318,6 +1666,245 @@ function InvestitureOverlay({ g, inv, onCast, onAuto, onRound2, onNext }) {
                 : r.pass ? "Tornar al joc ▸" : (inv.idx + 1 < inv.order.length ? "Següent candidat ▸" : "Repetició electoral ▸")}
             </button>
           </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function LawOverlay({ g, law, phase, onVote, onClose }) {
+  const proposer = byKey(g, law.proposer);
+  const cons = CONSELLERIES[law.cons];
+  const p = player(g);
+  const r = law.result;
+  const delta = law.to - law.from;
+  const isPlayerProposer = law.proposer === "PLAYER";
+  const dirTxt = delta > 0 ? "apujar" : "abaixar";
+  return (
+    <div className="overlay">
+      <div className="sheet">
+        <div className="ov-kicker">{law.route === "decret" ? "DECRET LLEI · GABINET" : "LLEI DE PRESSUPOST · PARLAMENT"}</div>
+        <div className="ov-title" style={{ color: proposer.color, fontSize: 24 }}>{proposer.name}</div>
+        <div className="ov-sub">proposa {dirTxt} <b>{cons.name}</b> de {law.from} a {law.to}</div>
+        <div className="law-change">
+          <span className="law-chip">{cons.name}</span>
+          <span className="law-arrow">{law.from} → <b style={{ color: delta > 0 ? "var(--green)" : "var(--red)" }}>{law.to}</b></span>
+          <span className="law-eff">{cons.desc}</span>
+        </div>
+
+        {phase === "vote" && !isPlayerProposer && (
+          <>
+            <p className="muted small center">Com hi vota el teu partit?</p>
+            <div className="vote-btns">
+              <button className="vb si" onClick={() => onVote("SÍ")}>SÍ</button>
+              <button className="vb abs" onClick={() => onVote("ABS")}>ABSTENCIÓ</button>
+              <button className="vb no" onClick={() => onVote("NO")}>NO</button>
+            </div>
+          </>
+        )}
+
+        {phase === "reveal" && r && (
+          <>
+            <div className="round-tag">{r.useCabinet ? "VOTACIÓ DEL GABINET (10 conselleries)" : "VOTACIÓ AL PARLAMENT (majoria simple)"}</div>
+            <div className="vote-tally">
+              <div className="tally-seg si" style={{ flex: Math.max(0.05, r.si) }}>SÍ {r.si}</div>
+              <div className="tally-seg abs" style={{ flex: Math.max(0.05, r.abs) }}>ABS {r.abs}</div>
+              <div className="tally-seg no" style={{ flex: Math.max(0.05, r.no) }}>NO {r.no}</div>
+            </div>
+            <div className="vote-list">
+              {r.votes.slice().sort((a, b) => b.w - a.w).map((v) => {
+                const pt = byKey(g, v.key);
+                return (
+                  <div className={"vote-row " + (pt.isPlayer ? "me" : "")} key={v.key}>
+                    <span className="pdot sm" style={{ background: pt.color }} />
+                    <span className="vname">{pt.name}</span>
+                    <span className="vseats">{v.w}</span>
+                    <span className={"vvote " + (v.vote === "SÍ" ? "si" : v.vote === "NO" ? "no" : "abs")}>{v.vote}</span>
+                  </div>
+                );
+              })}
+            </div>
+            <div className={"inv-verdict " + (r.pass ? "ok" : "ko")}>
+              {r.pass ? `Llei aprovada · ${cons.name} passa a ${law.to}` : "Llei rebutjada"}
+            </div>
+            {r.pass && r.reward > 0 && (
+              <div className="cab-gain">Com a oposició, la teva gestió de la crisi et dona <b>+{r.reward.toFixed(1)}%</b> de vots</div>
+            )}
+            <button className="ov-btn primary" style={{ background: p.color }} onClick={onClose}>Continuar ▸</button>
+          </>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function DebateSetup({ g, convokeDebate }) {
+  const [open, setOpen] = useState(false);
+  const [sel, setSel] = useState([]);
+  const me = player(g);
+  const rivals = g.parties.filter((p) => !p.isPlayer);
+  const meSeats = g.lastElection ? g.lastElection.catalonia.PLAYER : me.vote;
+  const toggle = (k) => setSel((s) => (s.includes(k) ? s.filter((x) => x !== k) : s.length < 5 ? [...s, k] : s));
+  return (
+    <div>
+      <p className="muted xsmall">Repta d'1 a 5 partits a un debat. El resultat mou la intenció de vot (fins a ±4%). Ordre de paraula a l'atzar.</p>
+      {!open ? (
+        <button className="btn-congress" style={{ borderColor: me.color, color: g.cp >= 15 ? me.color : undefined }} disabled={g.cp < 15} onClick={() => setOpen(true)}>CONVOCA UN DEBAT · 15 CP</button>
+      ) : (
+        <div className="debate-picker">
+          <div className="debate-parts">
+            {rivals.map((p) => {
+              const seatsT = g.lastElection ? g.lastElection.catalonia[p.key] : p.vote;
+              const rel = relationScore(me.ideo, p.ideo);
+              const prob = Math.round(clamp(0.5 + (meSeats - seatsT) / 40 + (rel - 45) / 300, 0.08, 0.92) * 100);
+              const on = sel.includes(p.key);
+              return (
+                <button key={p.key} className={"debate-part " + (on ? "on" : "")} onClick={() => toggle(p.key)} style={on ? { borderColor: p.color } : {}}>
+                  <span className="pdot sm" style={{ background: p.color }} />
+                  <span className="dp-name">{p.name}</span>
+                  <span className="dp-prob">accepta ~{prob}%</span>
+                </button>
+              );
+            })}
+          </div>
+          <div className="debate-actions">
+            <button className="law-btn" disabled={!sel.length || g.cp < 15} onClick={() => { convokeDebate(sel); setSel([]); setOpen(false); }}>Convoca ({sel.length}) · 15 CP</button>
+            <button className="cons-cancel" onClick={() => { setOpen(false); setSel([]); }}>Cancel·la</button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function DebateOfferOverlay({ g, proposerKey, onAccept, onDecline }) {
+  const p = byKey(g, proposerKey), me = player(g);
+  return (
+    <div className="overlay">
+      <div className="sheet center-sheet">
+        <div className="ov-kicker">PROPOSTA DE DEBAT</div>
+        <div className="ov-title" style={{ color: p.color, fontSize: 24 }}>{p.name}</div>
+        <p className="muted small center">et repta a un debat electoral cara a cara. El resultat mourà la intenció de vot dels dos partits (fins a ±4%).</p>
+        <button className="ov-btn primary" style={{ background: me.color, marginTop: 10 }} onClick={onAccept}>Accepto el debat ▸</button>
+        <button className="ov-btn" onClick={onDecline}>Declino</button>
+      </div>
+    </div>
+  );
+}
+
+function DebateOverlay({ parts, onFinish, onClose }) {
+  const [deb, setDeb] = useState(() => startDebateState(parts));
+  const [selCard, setSelCard] = useState(null);
+  const meIdx = deb.parts.findIndex((p) => p.isPlayer);
+  const meColor = deb.parts[meIdx].color;
+  const noAtk = deb.noAttackThisTurn[meIdx];
+  const others = [...Array(deb.np).keys()].filter((i) => i !== meIdx);
+  const live = (i) => deb.total[i] + deb.roundPts[i];
+
+  const play = (idx, cardId, tid) => { const d = cloneDebate(deb); debPlayerPlay(d, idx, cardId, tid); setSelCard(null); setDeb(d); };
+  const onCard = (idx, cardId) => { const def = debDef(cardId); if (def.target) setSelCard({ idx, cardId }); else play(idx, cardId, null); };
+  const dismissPopup = () => { const d = cloneDebate(deb); d.pending.shift(); setDeb(d); };
+  const pop = deb.pending[0];
+
+  return (
+    <div className="overlay">
+      <div className="sheet debate-sheet">
+        <div className="ov-kicker">DEBAT · RONDA {deb.round}/3 · TORN {Math.min(deb.turn, 3)}/3</div>
+        <div className="deb-board">
+          {deb.parts.map((p, i) => (
+            <div key={i} className={"deb-score " + (p.isPlayer ? "me" : "")} style={{ borderTopColor: p.color }}>
+              <span className="deb-name" style={{ color: p.color }}>{p.name}{p.isPlayer ? " (tu)" : ""}</span>
+              <span className="deb-pts">{live(i)}</span>
+              <span className="deb-pips">{[0, 1, 2].map((k) => <span key={k} className="deb-pip" style={k < deb.roundsWon[i] ? { background: p.color, borderColor: p.color } : {}} />)}</span>
+              {deb.esquiva[i] && <span className="deb-badge">🛡️ esquiva</span>}
+            </div>
+          ))}
+        </div>
+
+        {deb.plays.length > 0 && (
+          <div className="deb-plays">
+            {deb.plays.map((pl, i) => { const def = debDef(pl.cardId); const a = deb.parts[pl.pid]; return (
+              <div className="deb-play" key={i}>
+                <span className="pdot sm" style={{ background: a.color }} />
+                <span className="deb-play-ic">{def.icon}</span>
+                <span className="deb-play-tx"><b>{a.name}</b> · {def.name}{pl.tid != null ? ` → ${deb.parts[pl.tid].name}` : ""}</span>
+              </div>
+            ); })}
+          </div>
+        )}
+
+        {!pop && deb.phase === "turn" && (!selCard ? (
+          <>
+            <p className="muted xsmall center">La teva mà{noAtk ? " · exposat: no pots atacar aquest torn" : ""} — tria una carta:</p>
+            <div className="deb-hand">
+              {deb.hands[meIdx].map((cid, idx) => { const def = debDef(cid); const dis = noAtk && ATTACKS.includes(cid); return (
+                <button className="deb-card" key={idx} disabled={dis} onClick={() => onCard(idx, cid)}>
+                  <span className="dc-ic">{def.icon}</span>
+                  <span className="dc-name">{def.name}</span>
+                  <span className="dc-eff">{def.effect}</span>
+                </button>
+              ); })}
+            </div>
+          </>
+        ) : (
+          <>
+            <p className="muted xsmall center">A qui dirigeixes «{debDef(selCard.cardId).name}»?</p>
+            <div className="deb-targets">
+              {others.map((i) => (
+                <button key={i} className="deb-tgt" onClick={() => play(selCard.idx, selCard.cardId, i)} style={{ borderColor: deb.parts[i].color }}>
+                  <span className="pdot sm" style={{ background: deb.parts[i].color }} />{deb.parts[i].name}
+                </button>
+              ))}
+              <button className="cons-cancel" onClick={() => setSelCard(null)}>Enrere</button>
+            </div>
+          </>
+        ))}
+
+        {!pop && deb.phase === "turnend" && (
+          <button className="ov-btn primary" style={{ background: meColor }} onClick={() => { const d = cloneDebate(deb); debNextTurn(d); setDeb(d); }}>{deb.turn < 3 ? "Torn següent ▸" : "Fi de la ronda ▸"}</button>
+        )}
+        {!pop && deb.phase === "roundend" && (
+          <>
+            <div className="deb-roundmsg">{deb.roundMsg}</div>
+            <button className="ov-btn primary" style={{ background: meColor }} onClick={() => { const d = cloneDebate(deb); debContinueRound(d); setDeb(d); }}>Continuar ▸</button>
+          </>
+        )}
+        {!pop && deb.phase === "over" && (
+          <>
+            <div className="deb-final">{deb.ranking[0].isPlayer ? "🎉 Guanyes el debat!" : `Guanya ${deb.ranking[0].name}`}</div>
+            <div className="deb-vc">
+              {deb.voteChanges.slice().sort((a, b) => b.change - a.change).map((vc) => { const p = deb.parts.find((x) => x.key === vc.key); return (
+                <div className="deb-vc-row" key={vc.key}>
+                  <span className="pdot sm" style={{ background: p.color }} />
+                  <span className="deb-vc-name">{p.name}{p.isPlayer ? " (tu)" : ""}</span>
+                  <span className="deb-vc-chg" style={{ color: vc.change >= 0 ? "#3f7a4f" : "#b23a2e" }}>{vc.change >= 0 ? "+" : ""}{vc.change.toFixed(1)}%</span>
+                </div>
+              ); })}
+            </div>
+            <button className="ov-btn primary" style={{ background: meColor }} onClick={() => { onFinish(deb.voteChanges); onClose(); }}>Aplicar a l'enquesta ▸</button>
+          </>
+        )}
+
+        {pop && (
+          <div className="deb-popup-wrap">
+            {pop.kind === "attack" ? (
+              <div className="deb-popup atk">
+                <div className="dpop-ic">{debDef(pop.cardId).icon}</div>
+                <div className="dpop-h">T'han atacat!</div>
+                <div className="dpop-b"><b>{deb.parts[pop.attacker].name}</b> t'ha llançat «{debDef(pop.cardId).name}»</div>
+                <div className="dpop-dmg">{pop.dmg} punts</div>
+                <button className="ov-btn primary" style={{ background: meColor }} onClick={dismissPopup}>Encaixar ▸</button>
+              </div>
+            ) : (
+              <div className={"deb-popup " + (pop.win ? "good" : "bad")}>
+                <div className="dpop-ic">{debDef(pop.cardId).icon}</div>
+                <div className="dpop-h">{pop.splash ? "T'ha esquitxat!" : pop.win ? "Te'n surts!" : "T'han enxampat!"}</div>
+                <div className="dpop-b">{pop.splash ? "L'escàndol t'ha esquitxat a tu també." : pop.win ? "La teva jugada d'atzar surt bé." : "La teva jugada d'atzar et mossega."}</div>
+                <div className="dpop-dmg" style={{ color: pop.val >= 0 ? "#3f7a4f" : "#b23a2e" }}>{pop.val >= 0 ? "+" : ""}{pop.val} punts</div>
+                <button className="ov-btn primary" style={{ background: meColor }} onClick={dismissPopup}>Continuar ▸</button>
+              </div>
+            )}
+          </div>
         )}
       </div>
     </div>
@@ -1703,6 +2290,22 @@ input[type=range]{ width:100%; }
 .pais-delta{ font-family:'Oswald',sans-serif; font-size:12px; }
 .ind-charthead{ font-family:'Oswald',sans-serif; font-size:11px; letter-spacing:.8px; text-transform:uppercase; color:var(--inksoft); margin-bottom:4px; }
 
+/* variants compactes */
+.crisis-box.compact{ padding:7px 11px; gap:6px 10px; margin-bottom:8px; }
+.pais-grid.compact{ gap:7px; }
+.pais-card.sm{ padding:8px 10px; }
+.pais-card.sm .pais-label{ font-size:10.5px; }
+.pais-row{ display:flex; align-items:baseline; justify-content:space-between; gap:6px; margin:1px 0 4px; }
+.pais-val.sm{ font-size:22px; margin:0; }
+.pais-card.sm .pais-suf{ font-size:12px; }
+.pais-card.sm .sev-tag{ display:inline-block; }
+.tax-box.compact{ padding:10px 12px; }
+.tax-line{ display:flex; align-items:center; gap:10px; font-family:'Oswald',sans-serif; font-size:12.5px; letter-spacing:.4px; }
+.tax-line .tax-val{ font-family:var(--display); font-size:20px; }
+.tax-line .tax-inc{ margin-left:auto; font-size:12px; color:var(--inksoft); }
+.tax-line .tax-inc b{ font-family:var(--display); font-size:17px; margin-left:3px; }
+.tax-box.compact .tax-range{ margin:8px 0 4px; }
+
 /* oferta i resultat de gabinet a la investidura */
 .cab-offer{ font-size:12.5px; line-height:1.5; text-align:center; background:#f3ecd6; border:1px solid var(--line); border-radius:5px; padding:8px 10px; margin:4px 0 10px; }
 .cab-offer.has{ border-color:var(--gold); background:#f6efd8; }
@@ -1711,6 +2314,84 @@ input[type=range]{ width:100%; }
 .cab-result{ background:var(--panel); border:1px solid var(--line); border-radius:5px; padding:10px 12px; margin:8px 0; }
 .cab-result-h{ font-family:'Oswald',sans-serif; font-size:11px; letter-spacing:.8px; text-transform:uppercase; color:var(--inksoft); margin-bottom:8px; text-align:center; }
 .cab-gain{ margin-top:9px; text-align:center; font-family:'Oswald',sans-serif; font-size:13px; color:var(--green); background:#eef2e2; border-radius:4px; padding:6px; }
+
+/* conselleries i pressupost */
+.budget-summary{ display:flex; justify-content:space-between; gap:8px; flex-wrap:wrap; background:var(--panelHi); border:1px solid var(--line); border-radius:5px; padding:9px 12px; font-family:'Oswald',sans-serif; font-size:12px; }
+.budget-summary b{ font-family:var(--display); font-size:16px; }
+.budget-summary i{ font-style:normal; font-size:10px; color:var(--inksoft); }
+.cons-list{ display:flex; flex-direction:column; gap:8px; margin-top:8px; }
+.cons-row{ background:var(--panel); border:1px solid var(--line); border-radius:5px; padding:9px 11px; }
+.cons-row.changed{ border-color:var(--gold); box-shadow:0 0 0 1px var(--gold); }
+.cons-head{ display:flex; justify-content:space-between; align-items:baseline; gap:8px; margin-bottom:6px; }
+.cons-name{ font-family:'Oswald',sans-serif; font-weight:600; font-size:14px; letter-spacing:.4px; }
+.cons-desc{ font-size:10.5px; color:var(--inksoft); font-style:italic; }
+.cons-ctrl{ display:flex; align-items:center; gap:9px; }
+.cons-bar{ flex:1; height:12px; background:#ddd0ad; border-radius:6px; overflow:hidden; position:relative; box-shadow:inset 0 1px 2px rgba(0,0,0,.15); }
+.cons-fill{ position:absolute; top:0; left:0; height:100%; background:var(--gold); }
+.cons-ghost{ position:absolute; top:0; left:0; height:100%; background:repeating-linear-gradient(45deg, rgba(178,58,46,.55), rgba(178,58,46,.55) 5px, rgba(178,58,46,.25) 5px, rgba(178,58,46,.25) 10px); }
+.cons-num{ font-family:var(--display); font-weight:700; font-size:16px; width:52px; text-align:right; }
+.cons-num i{ font-style:normal; font-family:'Oswald',sans-serif; font-size:9px; color:var(--inksoft); margin-left:2px; }
+.cons-actions{ display:flex; flex-wrap:wrap; gap:6px; margin-top:9px; }
+.law-btn{ flex:1; min-width:130px; padding:8px; border:1.5px solid var(--lineDk); background:var(--panelHi); border-radius:4px; cursor:pointer; font-family:'Oswald',sans-serif; font-size:11.5px; letter-spacing:.4px; color:var(--ink); }
+.law-btn b{ color:var(--gold); }
+.law-btn.decret{ border-color:var(--gold); }
+.law-btn:disabled{ opacity:.4; cursor:not-allowed; }
+.cons-cancel{ padding:8px 12px; border:1px solid var(--line); background:transparent; border-radius:4px; cursor:pointer; font-family:'Oswald',sans-serif; font-size:11.5px; color:var(--inksoft); }
+
+/* finestra de llei */
+.law-change{ display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:10px; background:#f3ecd6; border:1px solid var(--line); border-radius:5px; padding:9px 12px; margin:8px 0 4px; }
+.law-chip{ font-family:'Oswald',sans-serif; font-weight:600; font-size:12px; background:var(--ink); color:var(--paper2); padding:3px 9px; border-radius:10px; letter-spacing:.4px; }
+.law-arrow{ font-family:var(--display); font-size:20px; }
+.law-eff{ font-size:11px; color:var(--inksoft); font-style:italic; width:100%; text-align:center; }
+
+/* debats — configuració */
+.debate-picker{ margin-top:8px; }
+.debate-parts{ display:flex; flex-direction:column; gap:5px; }
+.debate-part{ display:flex; align-items:center; gap:8px; padding:7px 10px; background:var(--panel); border:1.5px solid var(--line); border-radius:5px; cursor:pointer; text-align:left; }
+.debate-part.on{ background:var(--panelHi); box-shadow:inset 0 0 0 1px currentColor; }
+.dp-name{ font-family:'Oswald',sans-serif; font-size:13px; flex:1; }
+.dp-prob{ font-family:'Oswald',sans-serif; font-size:10.5px; color:var(--inksoft); }
+.debate-actions{ display:flex; gap:6px; margin-top:8px; }
+
+/* debats — finestra */
+.debate-sheet{ max-width:560px; position:relative; }
+.deb-board{ display:flex; flex-wrap:wrap; gap:6px; margin:6px 0 10px; }
+.deb-score{ flex:1; min-width:88px; background:var(--panelHi); border:1px solid var(--line); border-top:3px solid; border-radius:5px; padding:7px 8px; display:flex; flex-direction:column; align-items:center; gap:1px; position:relative; }
+.deb-score.me{ box-shadow:inset 0 0 0 1.5px var(--lineDk); }
+.deb-name{ font-family:'Oswald',sans-serif; font-size:11px; font-weight:600; text-align:center; line-height:1.1; }
+.deb-pts{ font-family:var(--display); font-weight:700; font-size:24px; }
+.deb-pips{ display:flex; gap:3px; }
+.deb-pip{ width:9px; height:9px; border-radius:50%; border:1.5px solid var(--lineDk); background:transparent; }
+.deb-badge{ font-size:9px; font-family:'Oswald',sans-serif; color:var(--accent2, #5b7fff); }
+.deb-plays{ display:flex; flex-direction:column; gap:3px; background:var(--panel); border:1px solid var(--line); border-radius:5px; padding:7px 9px; margin-bottom:10px; max-height:150px; overflow-y:auto; }
+.deb-play{ display:flex; align-items:center; gap:7px; font-size:12px; }
+.deb-play-ic{ font-size:15px; }
+.deb-play-tx{ font-family:'Oswald',sans-serif; }
+.deb-hand{ display:flex; gap:8px; justify-content:center; }
+.deb-card{ flex:1; max-width:150px; background:var(--panelHi); border:1.5px solid var(--lineDk); border-radius:8px; padding:12px 8px; cursor:pointer; display:flex; flex-direction:column; align-items:center; gap:4px; transition:transform .1s, box-shadow .15s; }
+.deb-card:hover:not(:disabled){ transform:translateY(-3px); box-shadow:0 5px 14px rgba(60,48,28,.22); }
+.deb-card:disabled{ opacity:.35; cursor:not-allowed; }
+.dc-ic{ font-size:28px; line-height:1; }
+.dc-name{ font-family:'Oswald',sans-serif; font-weight:600; font-size:12px; text-align:center; }
+.dc-eff{ font-size:10px; color:var(--inksoft); text-align:center; }
+.deb-targets{ display:flex; flex-wrap:wrap; gap:6px; justify-content:center; }
+.deb-tgt{ display:flex; align-items:center; gap:6px; padding:7px 11px; background:var(--panelHi); border:1.5px solid; border-radius:5px; cursor:pointer; font-family:'Oswald',sans-serif; font-size:12px; }
+.deb-roundmsg{ text-align:center; font-family:var(--display); font-size:18px; margin:8px 0; }
+.deb-final{ text-align:center; font-family:var(--display); font-weight:700; font-size:22px; margin:6px 0 10px; }
+.deb-vc{ display:flex; flex-direction:column; gap:3px; margin-bottom:10px; }
+.deb-vc-row{ display:flex; align-items:center; gap:8px; padding:5px 8px; border-bottom:1px dashed var(--line); }
+.deb-vc-name{ font-family:'Oswald',sans-serif; font-size:13px; flex:1; }
+.deb-vc-chg{ font-family:var(--display); font-weight:700; font-size:16px; }
+.deb-popup-wrap{ position:absolute; inset:0; background:rgba(44,38,29,.55); display:flex; align-items:center; justify-content:center; border-radius:inherit; z-index:5; animation:fade .2s ease; }
+.deb-popup{ width:78%; max-width:340px; background:var(--paper2); border:2px solid var(--lineDk); border-radius:12px; padding:20px 18px; text-align:center; box-shadow:0 12px 34px rgba(0,0,0,.4); animation:pop .35s cubic-bezier(.2,1.3,.4,1) both; }
+.deb-popup.atk{ border-color:var(--red); }
+.deb-popup.good{ border-color:var(--green); }
+.deb-popup.bad{ border-color:var(--red); }
+.dpop-ic{ font-size:44px; line-height:1; }
+.dpop-h{ font-family:var(--display); font-weight:700; font-size:22px; margin:6px 0 4px; }
+.dpop-b{ font-size:12.5px; color:var(--inksoft); line-height:1.5; margin-bottom:8px; }
+.dpop-dmg{ font-family:var(--display); font-weight:700; font-size:26px; color:var(--red); margin-bottom:12px; }
+.deb-popup .ov-btn{ margin-top:0; }
 .palmares{ display:flex; gap:10px; }
 .palm{ flex:1; background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:12px; display:flex; flex-direction:column; align-items:center; }
 .palm span{ font-size:11px; color:var(--inksoft); font-family:'Oswald',sans-serif; letter-spacing:.5px; }
