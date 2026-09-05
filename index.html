@@ -93,6 +93,54 @@ function relationLabel(score) {
   return { t: "Hostil", c: "#b23a2e" };
 }
 
+/* ---- País: ingressos, severitat i crisis ---- */
+const NEUTRAL_TAX = 40;
+function computeIncome(taxes, pib) {
+  // ingressos de l'Estat: pugen amb els impostos i amb l'activitat econòmica
+  return Math.round(taxes * (0.9 + Math.max(-0.4, (pib - 2) * 0.05)));
+}
+// nivell de cada indicador (higher/lower better segons el cas)
+const SEV = {
+  pib: (v) => (v < -1 ? "critic" : v < 0.5 ? "greu" : v < 1.5 ? "lleu" : "ok"),
+  inflacio: (v) => (v > 8 ? "critic" : v > 5.5 ? "greu" : v > 4 ? "lleu" : "ok"),
+  atur: (v) => (v > 20 ? "critic" : v > 15 ? "greu" : v > 12 ? "lleu" : "ok"),
+  benestar: (v) => (v < 30 ? "critic" : v < 45 ? "greu" : v < 55 ? "lleu" : "ok"),
+};
+const SEVMETA = {
+  ok: { t: "Estable", c: "#3f7a4f", r: 0 },
+  lleu: { t: "Lleu", c: "#c08a2e", r: 1 },
+  greu: { t: "Greu", c: "#c0642e", r: 2 },
+  critic: { t: "Crític", c: "#b23a2e", r: 3 },
+};
+const INDGOOD = { pib: (v) => v >= 1.5, inflacio: (v) => v <= 3.5, atur: (v) => v <= 10, benestar: (v) => v >= 55 };
+// per als indicadors on "puja" és dolent, invertim la fletxa de color
+const IND_HIGHER_BETTER = { pib: true, inflacio: false, atur: false, benestar: true };
+
+// quantes conselleries (0..3) ofereix un partit al jugador segons la relació
+function cabinetOffer(score) {
+  if (score >= 72) return 3;
+  if (score >= 52) return 2;
+  if (score >= 30) return 1;
+  return 0;
+}
+// repartiment de 10 conselleries entre els que voten SÍ, proporcional als escons.
+// El jugador (si no és el candidat i vota SÍ) rep 'playerOffer' de forma reservada.
+function distributeCabinet(parties, votes, playerVote, playerOffer, candKey) {
+  const cab = {}; parties.forEach((p) => (cab[p.key] = 0));
+  let remaining = 10;
+  const playerPartner = candKey !== "PLAYER" && playerVote === "SÍ" && playerOffer > 0;
+  if (playerPartner) { cab.PLAYER = Math.min(playerOffer, remaining); remaining -= cab.PLAYER; }
+  const yes = votes.filter((v) => v.vote === "SÍ" && !(playerPartner && v.key === "PLAYER"));
+  const totalSeats = yes.reduce((s, v) => s + v.seats, 0) || 1;
+  const quotas = yes.map((v) => ({ key: v.key, q: (v.seats / totalSeats) * remaining }));
+  quotas.forEach((x) => { const f = Math.floor(x.q); cab[x.key] += f; x.rem = x.q - f; });
+  let assigned = quotas.reduce((s, x) => s + Math.floor(x.q), 0);
+  let left = remaining - assigned;
+  quotas.sort((a, b) => b.rem - a.rem);
+  for (let i = 0; i < left && quotas.length; i++) cab[quotas[i % quotas.length].key]++;
+  return cab;
+}
+
 function normalizeVotes(parties) {
   const t = parties.reduce((s, p) => s + p.vote, 0) || 1;
   parties.forEach((p) => (p.vote = (p.vote / t) * 100));
@@ -189,6 +237,10 @@ function makeGame(mode, name, color, ideo, existingKey, startVote) {
     pollHistory: [{ turn: 0, votes: kv(parties, "vote"), seats: { ...seats0 } }],
     electionHistory: [],
     pais: { pib: 2.1, inflacio: 3.0, atur: 9.5, benestar: 60 },
+    taxes: 40,
+    income: computeIncome(40, 2.1),
+    paisHistory: [{ turn: 0, pib: 2.1, inflacio: 3.0, atur: 9.5, benestar: 60, taxes: 40, income: computeIncome(40, 2.1) }],
+    cabinet: null,
     electionsWon: 0,
     presidencies: 0,
     president: null,
@@ -269,6 +321,10 @@ function App() {
     setToast("Congrés convocat · es resol el proper torn");
   }
 
+  function setTaxes(v) {
+    setG((prev) => (prev ? { ...prev, taxes: v, income: computeIncome(v, prev.pais.pib) } : prev));
+  }
+
   /* ---------------------------- Passar torn ----------------------------- */
   function passTurn() {
     if (overlay || !g) return;
@@ -307,18 +363,25 @@ function App() {
     const np = parties.find((p) => p.isPlayer);
     const approval = calcApproval(np.ideo, prev.approvedIdeo, np.vote, prev.baselineVote, gauss(0, 3));
 
-    // 4) Indicadors de país (bàsic, v1)
+    // 4) Indicadors de país: soroll + govern + IMPOSTOS
     const gov = prev.president ? byKey(prev, prev.president) : null;
-    const govEcon = gov ? gov.ideo[7] : 5;
+    const govEcon = gov ? gov.ideo[7] : 5;         // eix ECONOMIA del govern
+    const taxDev = (prev.taxes - NEUTRAL_TAX) / 100; // -0.4 .. +0.6
     const pais = {
-      pib: round1(clamp(prev.pais.pib + gauss(0, 0.35) + (govEcon - 5) * 0.03, -4, 6)),
-      inflacio: round1(clamp(prev.pais.inflacio + gauss(0, 0.25), 0, 12)),
-      atur: round1(clamp(prev.pais.atur + gauss(0, 0.3) - (prev.pais.pib - 2) * 0.1, 3, 26)),
-      benestar: Math.round(clamp(prev.pais.benestar + gauss(0, 1.6) + (prev.pais.pib - 2) * 0.6 - (prev.pais.inflacio - 3) * 0.5, 0, 100)),
+      // impostos alts frenen el creixement; baixos l'estimulen
+      pib: round1(clamp(prev.pais.pib + gauss(0, 0.35) + (govEcon - 5) * 0.03 - taxDev * 0.9, -4, 6)),
+      // impostos alts refreden la inflació
+      inflacio: round1(clamp(prev.pais.inflacio + gauss(0, 0.25) - taxDev * 0.7, 0, 12)),
+      // impostos alts pugen l'atur; el creixement el baixa
+      atur: round1(clamp(prev.pais.atur + gauss(0, 0.3) - (prev.pais.pib - 2) * 0.1 + taxDev * 1.2, 3, 26)),
+      // impostos alts financen més benestar; la inflació i la recessió el desgasten
+      benestar: Math.round(clamp(prev.pais.benestar + gauss(0, 1.4) + (prev.pais.pib - 2) * 0.6 - (prev.pais.inflacio - 3) * 0.5 + taxDev * 2.2, 0, 100)),
     };
+    const income = computeIncome(prev.taxes, pais.pib);
+    const paisHistory = [...prev.paisHistory, { turn: t, ...pais, taxes: prev.taxes, income }].slice(-80);
 
     const congressCooldown = Math.max(0, prev.congressCooldown - 1);
-    let next = { ...prev, turn: t, momentum, parties, poll, pollHistory, approval, pais, congressCooldown };
+    let next = { ...prev, turn: t, momentum, parties, poll, pollHistory, approval, pais, income, paisHistory, congressCooldown };
 
     // 5) Bases abandonen el líder
     if (approval <= 0) {
@@ -428,7 +491,9 @@ function App() {
     const round2Pass = siSeats > noSeats;         // 2a volta: majoria simple (abstencions no bloquegen)
     const pass = round1Pass || round2Pass;
     const investedRound = round1Pass ? 1 : round2Pass ? 2 : null;
-    return { votes, siSeats, noSeats, absSeats, round1Pass, round2Pass, pass, investedRound, candKey };
+    const playerOffer = candKey === "PLAYER" ? 0 : cabinetOffer(relationScore(byKey(gg, "PLAYER").ideo, cand.ideo));
+    const cabinet = pass ? distributeCabinet(gg.parties, votes, playerVote, playerOffer, candKey) : null;
+    return { votes, siSeats, noSeats, absSeats, round1Pass, round2Pass, pass, investedRound, candKey, playerOffer, cabinet };
   }
 
   function castInvestiture(playerVote) {
@@ -441,19 +506,22 @@ function App() {
       let approval = prev.approval;
       let president = prev.president;
       let presidencies = prev.presidencies;
+      let cabinet = prev.cabinet;
       const cand = parties.find((p) => p.key === candKey);
       const me = parties.find((p) => p.isPlayer);
 
       if (result.pass) {
         president = candKey;
+        cabinet = result.cabinet;
         if (candKey === "PLAYER") { cp += 5; approval = clamp(approval + 8, 0, 100); presidencies += 1; }
         else if (playerVote === "SÍ") {
-          cp += 2;
+          const posts = (result.cabinet && result.cabinet.PLAYER) || 0;
+          cp += 2 + posts * 2; // conselleries obtingudes → CP proporcional
           const d = wdist(me.ideo, cand.ideo);
           if (d > 3) { me.vote = Math.max(0.3, me.vote - (d - 3) * 1.1); normalizeVotes(parties); approval = clamp(approval - Math.round((d - 3) * 4), 0, 100); }
         }
       }
-      return { ...prev, parties, cp, approval, president, presidencies };
+      return { ...prev, parties, cp, approval, president, presidencies, cabinet };
     });
     setInv({ ...inv, playerVote, phase: "r1", result });
   }
@@ -467,7 +535,7 @@ function App() {
     const result = resolveCandidate(g, candKey, "SÍ");
     setG((prev) => {
       if (!result.pass) return prev;
-      return { ...prev, president: candKey, cp: prev.cp + 5, approval: clamp(prev.approval + 8, 0, 100), presidencies: prev.presidencies + 1 };
+      return { ...prev, president: candKey, cabinet: result.cabinet, cp: prev.cp + 5, approval: clamp(prev.approval + 8, 0, 100), presidencies: prev.presidencies + 1 };
     });
     setInv({ ...inv, phase: "r1", result });
   }
@@ -478,8 +546,8 @@ function App() {
     if (inv.idx + 1 < inv.order.length) {
       setInv({ order: inv.order, idx: inv.idx + 1, playerVote: null, phase: "choose", result: null });
     } else {
-      // cap candidat investit → repetició electoral en 2 torns
-      setG((prev) => ({ ...prev, nextElectionAt: prev.turn + 2, president: null }));
+      // cap candidat investit → repetició electoral en 2 torns, sense govern
+      setG((prev) => ({ ...prev, nextElectionAt: prev.turn + 2, president: null, cabinet: null }));
       setOverlay(null); setInv(null);
       setToast("Cap candidat investit · repetició electoral en 2 torns");
     }
@@ -501,7 +569,7 @@ function App() {
           <Setup {...{ mode, setMode, pname, setPname, pcolor, setPcolor, pideo, setPideo, pvoteStart, setPvoteStart, existing, setExisting, start, rules, setRules }} />
         ) : (
           <Game
-            {...{ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, overlay, rules, setRules }}
+            {...{ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, setTaxes, overlay, rules, setRules }}
           />
         )}
 
@@ -628,7 +696,7 @@ function RulesText() {
 
 /* -------------------------------- GAME ----------------------------------- */
 
-function Game({ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, overlay, rules, setRules }) {
+function Game({ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, setTaxes, overlay, rules, setRules }) {
   const p = player(g);
   const untilElection = Math.max(0, g.nextElectionAt - g.turn);
   return (
@@ -637,7 +705,7 @@ function Game({ g, tab, setTab, adjustIdeo, passTurn, convokeCongress, overlay, 
       <div className="content">
         {tab === "partit" && <TabPartit g={g} adjustIdeo={adjustIdeo} convokeCongress={convokeCongress} rules={rules} setRules={setRules} />}
         {tab === "resultats" && <TabResultats g={g} />}
-        {tab === "pais" && <TabPais g={g} />}
+        {tab === "pais" && <TabPais g={g} setTaxes={setTaxes} />}
       </div>
 
       <div className="turnbar">
@@ -861,17 +929,44 @@ function SeatBar({ g, counts }) {
 }
 
 /* ---- Tab PAÍS ---- */
-function TabPais({ g }) {
+function Cabinet({ g }) {
+  if (!g.cabinet) return <p className="muted xsmall empty">Encara no s'ha format cap gabinet.</p>;
+  const holders = g.parties.filter((p) => (g.cabinet[p.key] || 0) > 0)
+    .sort((a, b) => g.cabinet[b.key] - g.cabinet[a.key]);
+  const dots = [];
+  holders.forEach((p) => { for (let i = 0; i < g.cabinet[p.key]; i++) dots.push(p); });
+  while (dots.length < 10) dots.push(null);
+  return (
+    <div className="cabinet">
+      <div className="cab-dots">
+        {dots.map((p, i) => (
+          <span key={i} className={"cab-dot " + (p && p.isPlayer ? "me" : "")} style={{ background: p ? p.color : "transparent", borderColor: p ? p.color : "var(--line)" }} title={p ? p.name : "buida"} />
+        ))}
+      </div>
+      <div className="cab-legend">
+        {holders.map((p) => (
+          <span className="cab-leg" key={p.key}><span className="pdot sm" style={{ background: p.color }} />{p.name}{p.isPlayer ? " (tu)" : ""} · {g.cabinet[p.key]}</span>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TabPais({ g, setTaxes }) {
+  const [openInd, setOpenInd] = useState(null);
+  const prevP = g.paisHistory.length > 1 ? g.paisHistory[g.paisHistory.length - 2] : null;
   const items = [
-    { k: "pib", label: "PIB", val: g.pais.pib.toFixed(1) + "%", good: g.pais.pib >= 1.5 },
-    { k: "inflacio", label: "Inflació", val: g.pais.inflacio.toFixed(1) + "%", good: g.pais.inflacio <= 3.5 },
-    { k: "atur", label: "Atur", val: g.pais.atur.toFixed(1) + "%", good: g.pais.atur <= 10 },
-    { k: "benestar", label: "Benestar", val: g.pais.benestar + "/100", good: g.pais.benestar >= 55 },
+    { k: "pib", label: "PIB", suf: "%", val: g.pais.pib.toFixed(1), num: g.pais.pib },
+    { k: "inflacio", label: "Inflació", suf: "%", val: g.pais.inflacio.toFixed(1), num: g.pais.inflacio },
+    { k: "atur", label: "Atur", suf: "%", val: g.pais.atur.toFixed(1), num: g.pais.atur },
+    { k: "benestar", label: "Benestar", suf: "/100", val: g.pais.benestar, num: g.pais.benestar },
   ];
+  const crises = items.map((it) => ({ it, sev: SEV[it.k](it.num) })).filter((x) => SEVMETA[x.sev].r >= 2);
   const gov = g.president ? byKey(g, g.president) : null;
+
   return (
     <div className="pad">
-      <SectionTitle>Govern</SectionTitle>
+      <SectionTitle>Govern i gabinet</SectionTitle>
       {gov ? (
         <div className="gov-banner" style={{ borderColor: gov.color }}>
           <span className="gov-dot" style={{ background: gov.color }} />
@@ -889,25 +984,99 @@ function TabPais({ g }) {
           </div>
         </div>
       )}
+      <Cabinet g={g} />
 
-      <SectionTitle>Estat del país</SectionTitle>
-      <div className="pais-grid">
-        {items.map((it) => (
-          <div className="pais-card" key={it.k}>
-            <div className="pais-label">{it.label}</div>
-            <div className="pais-val" style={{ color: it.good ? "#3f7a4f" : "#b23a2e" }}>{it.val}</div>
-          </div>
-        ))}
+      <SectionTitle>Impostos i ingressos</SectionTitle>
+      <div className="tax-box">
+        <div className="tax-head">
+          <span>Pressió fiscal</span>
+          <b className="tax-val">{g.taxes}%</b>
+        </div>
+        <input className="tax-range" type="range" min={0} max={100} step={5} value={g.taxes}
+          onChange={(e) => setTaxes(+e.target.value)} />
+        <div className="tax-foot">
+          <span>Ingressos de l'Estat</span><b style={{ color: "var(--green)" }}>{g.income}</b>
+        </div>
+        <p className="muted xsmall">Apujar impostos apuja ingressos i benestar, però frena el PIB i apuja l'atur (tot i que refreda la inflació). Abaixar-los fa el contrari.</p>
       </div>
-      <p className="muted small">
-        Els indicadors evolucionen cada torn i el govern hi influeix. (Mòdul bàsic — a desenvolupar.)
-      </p>
+
+      <SectionTitle>Situació del país</SectionTitle>
+      {crises.length > 0 ? (
+        <div className="crisis-box">
+          <span className="crisis-h">⚠ {crises.length === 1 ? "Crisi activa" : "Crisis actives"}</span>
+          {crises.map(({ it, sev }) => (
+            <span className="crisis-item" key={it.k} style={{ color: SEVMETA[sev].c }}>{it.label}: {SEVMETA[sev].t}</span>
+          ))}
+        </div>
+      ) : (
+        <div className="crisis-box ok"><span className="crisis-h" style={{ color: "var(--green)" }}>✓ Sense crisis · país estable</span></div>
+      )}
+
+      <div className="pais-grid">
+        {items.map((it) => {
+          const sev = SEV[it.k](it.num);
+          const meta = SEVMETA[sev];
+          const d = prevP ? it.num - prevP[it.k] : 0;
+          const higherBetter = IND_HIGHER_BETTER[it.k];
+          const goodDir = (d > 0) === higherBetter;
+          const up = Math.abs(d) >= (it.k === "benestar" ? 1 : 0.05);
+          return (
+            <div className={"pais-card clickable " + (openInd === it.k ? "open" : "")} key={it.k} onClick={() => setOpenInd(openInd === it.k ? null : it.k)}>
+              <div className="pais-label">{it.label} <span className="pais-caret">{openInd === it.k ? "▾" : "▸"}</span></div>
+              <div className="pais-val" style={{ color: meta.c }}>{it.val}<span className="pais-suf">{it.suf}</span></div>
+              <div className="pais-meta">
+                <span className="sev-tag" style={{ background: meta.c }}>{meta.t}</span>
+                {up && <span className="pais-delta" style={{ color: goodDir ? "#3f7a4f" : "#b23a2e" }}>{d > 0 ? "▲" : "▼"}{Math.abs(d).toFixed(it.k === "benestar" ? 0 : 1)}</span>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {openInd && (
+        <div className="chart-box" style={{ marginTop: 10 }}>
+          <div className="ind-charthead">Evolució · {items.find((x) => x.k === openInd).label}</div>
+          <IndicatorChart history={g.paisHistory} field={openInd} color={SEVMETA[SEV[openInd](g.pais[openInd])].c} suf={items.find((x) => x.k === openInd).suf} />
+        </div>
+      )}
+
       <SectionTitle>Palmarès</SectionTitle>
       <div className="palmares">
         <div className="palm"><span>Eleccions guanyades</span><b>{g.electionsWon}</b></div>
         <div className="palm"><span>Presidències</span><b>{g.presidencies}</b></div>
       </div>
     </div>
+  );
+}
+
+/* gràfic d'un sol indicador amb min/max propis (admet negatius) */
+function IndicatorChart({ history, field, color, suf }) {
+  if (!history || history.length < 2) return <p className="muted xsmall empty">Passa uns quants torns per veure l'evolució.</p>;
+  const W = 320, H = 130, padL = 30, padR = 8, padT = 10, padB = 18;
+  const plotW = W - padL - padR, plotH = H - padT - padB;
+  const vals = history.map((f) => f[field]);
+  let mn = Math.min(...vals), mx = Math.max(...vals);
+  if (mn === mx) { mn -= 1; mx += 1; }
+  const pd = (mx - mn) * 0.15; mn -= pd; mx += pd;
+  const n = history.length;
+  const xAt = (i) => padL + (i / (n - 1)) * plotW;
+  const yAt = (v) => padT + plotH - ((v - mn) / (mx - mn)) * plotH;
+  const ticks = [mn, (mn + mx) / 2, mx];
+  const xIdx = [0, Math.floor((n - 1) / 2), n - 1].filter((v, i, a) => a.indexOf(v) === i);
+  const dPath = vals.map((v, i) => `${i === 0 ? "M" : "L"}${xAt(i).toFixed(1)},${yAt(v).toFixed(1)}`).join(" ");
+  const area = `${dPath} L${xAt(n - 1).toFixed(1)},${(padT + plotH).toFixed(1)} L${xAt(0).toFixed(1)},${(padT + plotH).toFixed(1)} Z`;
+  return (
+    <svg className="linechart" viewBox={`0 0 ${W} ${H}`} width="100%" preserveAspectRatio="xMidYMid meet">
+      {ticks.map((t, i) => (
+        <g key={i}>
+          <line x1={padL} y1={yAt(t)} x2={W - padR} y2={yAt(t)} className="lc-grid" />
+          <text x={padL - 5} y={yAt(t) + 3} className="lc-ylab">{t.toFixed(1)}{suf === "/100" ? "" : suf}</text>
+        </g>
+      ))}
+      {xIdx.map((i) => (<text key={i} x={xAt(i)} y={H - 5} className="lc-xlab" textAnchor="middle">T{history[i].turn}</text>))}
+      <path d={area} fill={color} opacity="0.13" />
+      <path d={dPath} fill="none" stroke={color} strokeWidth="2.4" strokeLinejoin="round" strokeLinecap="round" />
+      <circle cx={xAt(n - 1)} cy={yAt(vals[n - 1])} r="3.4" fill={color} stroke="#F1E9D2" strokeWidth="1.4" />
+    </svg>
   );
 }
 
@@ -978,7 +1147,7 @@ function ElectionOverlay({ g, election, onContinue }) {
               <div className="seatbar-cap">Recompte en curs…</div>
             </div>
             <div className="seat-list">
-              {ordered.map((pt) => (
+              {[...ordered].sort((a, b) => (disp[b.key] || 0) - (disp[a.key] || 0)).map((pt) => (
                 <div className={"seat-row " + (pt.isPlayer ? "me" : "")} key={pt.key}>
                   <span className="pdot" style={{ background: pt.color }} />
                   <span className="pname">{pt.name}</span>
@@ -1062,17 +1231,25 @@ function InvestitureOverlay({ g, inv, onCast, onAuto, onRound2, onNext }) {
         <div className="ov-title" style={{ color: cand.color }}>{cand.name}</div>
         <div className="ov-sub">candidat/a a la presidència ({g.lastElection.catalonia[candKey]} diputats)</div>
 
-        {inv.phase === "choose" && !isPlayerCand && (
-          <>
-            <p className="muted small center">Com vota el teu partit la investidura de {cand.name}?</p>
-            <div className="vote-btns">
-              <button className="vb si" onClick={() => onCast("SÍ")}>SÍ</button>
-              <button className="vb abs" onClick={() => onCast("ABS")}>ABSTENCIÓ</button>
-              <button className="vb no" onClick={() => onCast("NO")}>NO</button>
-            </div>
-            <p className="muted xsmall center">Distància ideològica amb tu: <b>{wdist(p.ideo, cand.ideo).toFixed(1)}</b>. Investir algú molt llunyà et fa perdre vots.</p>
-          </>
-        )}
+        {inv.phase === "choose" && !isPlayerCand && (() => {
+          const offer = cabinetOffer(relationScore(p.ideo, cand.ideo));
+          return (
+            <>
+              <p className="muted small center">Com vota el teu partit la investidura de {cand.name}?</p>
+              <div className={"cab-offer " + (offer > 0 ? "has" : "")}>
+                {offer > 0
+                  ? <>Si votes <b>SÍ</b>, {cand.name} t'ofereix <b>{offer} {offer === 1 ? "conselleria" : "conselleries"}</b> al gabinet <span className="cab-offer-dots">{Array.from({ length: offer }).map((_, i) => <span key={i} className="cab-dot" style={{ background: p.color, borderColor: p.color }} />)}</span> (+{offer * 2} CP)</>
+                  : <>{cand.name} no t'ofereix cap conselleria (relació massa distant).</>}
+              </div>
+              <div className="vote-btns">
+                <button className="vb si" onClick={() => onCast("SÍ")}>SÍ</button>
+                <button className="vb abs" onClick={() => onCast("ABS")}>ABSTENCIÓ</button>
+                <button className="vb no" onClick={() => onCast("NO")}>NO</button>
+              </div>
+              <p className="muted xsmall center">Distància ideològica amb tu: <b>{wdist(p.ideo, cand.ideo).toFixed(1)}</b>. Investir algú molt llunyà et fa perdre vots.</p>
+            </>
+          );
+        })()}
 
         {showRound && r && (
           <>
@@ -1102,11 +1279,34 @@ function InvestitureOverlay({ g, inv, onCast, onAuto, onRound2, onNext }) {
               <div className="round-note">Sense majoria absoluta: {r.siSeats} SÍ (calen 68). Es passa a la segona votació, on les abstencions ja no bloquegen.</div>
             )}
             {passedNow ? (
-              <div className="inv-verdict ok">
-                {isPlayerCand
-                  ? `🏛️ Investit president a la ${inv.phase === "r1" ? "1a" : "2a"} votació! +5 CP`
-                  : `${cand.name} és investit/da a la ${inv.phase === "r1" ? "1a" : "2a"} votació${inv.playerVote === "SÍ" ? " · +2 CP pel teu sí" : ""}`}
-              </div>
+              <>
+                <div className="inv-verdict ok">
+                  {isPlayerCand
+                    ? `🏛️ Investit president a la ${inv.phase === "r1" ? "1a" : "2a"} votació! +5 CP`
+                    : `${cand.name} és investit/da a la ${inv.phase === "r1" ? "1a" : "2a"} votació`}
+                </div>
+                {r.cabinet && (() => {
+                  const holders = g.parties.filter((pt) => (r.cabinet[pt.key] || 0) > 0).sort((a, b) => r.cabinet[b.key] - r.cabinet[a.key]);
+                  const dots = [];
+                  holders.forEach((pt) => { for (let i = 0; i < r.cabinet[pt.key]; i++) dots.push(pt); });
+                  while (dots.length < 10) dots.push(null);
+                  const myPosts = r.cabinet.PLAYER || 0;
+                  return (
+                    <div className="cab-result">
+                      <div className="cab-result-h">Gabinet de govern (10 conselleries)</div>
+                      <div className="cab-dots">
+                        {dots.map((pt, i) => <span key={i} className={"cab-dot " + (pt && pt.isPlayer ? "me" : "")} style={{ background: pt ? pt.color : "transparent", borderColor: pt ? pt.color : "var(--line)" }} title={pt ? pt.name : "buida"} />)}
+                      </div>
+                      <div className="cab-legend">
+                        {holders.map((pt) => <span className="cab-leg" key={pt.key}><span className="pdot sm" style={{ background: pt.color }} />{pt.name}{pt.isPlayer ? " (tu)" : ""} · {r.cabinet[pt.key]}</span>)}
+                      </div>
+                      {!isPlayerCand && inv.playerVote === "SÍ" && (
+                        <div className="cab-gain">{myPosts > 0 ? `Entres al govern amb ${myPosts} ${myPosts === 1 ? "conselleria" : "conselleries"} · +${2 + myPosts * 2} CP` : "+2 CP pel teu sí"}</div>
+                      )}
+                    </div>
+                  );
+                })()}
+              </>
             ) : inv.phase === "r2" ? (
               <div className="inv-verdict ko">Investidura fracassada ({r.siSeats} SÍ vs {r.noSeats} NO)</div>
             ) : null}
@@ -1466,9 +1666,51 @@ input[type=range]{ width:100%; }
 .gov-seats{ font-family:var(--display); font-weight:700; font-size:30px; flex:none; }
 .gov-seats i{ display:block; font-style:normal; font-family:'Oswald',sans-serif; font-size:10px; font-weight:400; color:var(--inksoft); text-align:right; letter-spacing:.5px; }
 .pais-grid{ display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-.pais-card{ background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:14px; text-align:center; }
-.pais-label{ font-family:'Oswald',sans-serif; font-size:12px; letter-spacing:1px; text-transform:uppercase; color:var(--inksoft); }
-.pais-val{ font-family:var(--display); font-weight:700; font-size:28px; margin-top:4px; }
+
+/* gabinet */
+.cabinet{ margin-top:10px; }
+.cab-dots{ display:flex; gap:6px; flex-wrap:wrap; }
+.cab-dot{ width:20px; height:20px; border-radius:50%; border:2px solid; flex:none; box-shadow:inset 0 -2px 3px rgba(0,0,0,.15); }
+.cab-dot.me{ box-shadow:0 0 0 2px var(--ink), inset 0 -2px 3px rgba(0,0,0,.15); }
+.cab-legend{ display:flex; flex-wrap:wrap; gap:8px 14px; margin-top:9px; }
+.cab-leg{ display:flex; align-items:center; gap:5px; font-family:'Oswald',sans-serif; font-size:11.5px; }
+
+/* impostos */
+.tax-box{ background:var(--panel); border:1px solid var(--line); border-radius:5px; padding:12px 14px; }
+.tax-head, .tax-foot{ display:flex; justify-content:space-between; align-items:center; font-family:'Oswald',sans-serif; font-size:12.5px; letter-spacing:.5px; }
+.tax-foot{ margin-top:8px; padding-top:8px; border-top:1px dashed var(--line); }
+.tax-val{ font-family:var(--display); font-size:22px; }
+.tax-foot b{ font-family:var(--display); font-size:20px; }
+.tax-range{ width:100%; margin:10px 0 2px; accent-color:var(--gold); }
+
+/* crisis */
+.crisis-box{ display:flex; flex-wrap:wrap; align-items:center; gap:8px 14px; background:#f7ecd6; border-left:4px solid var(--red); border-radius:0 5px 5px 0; padding:10px 13px; margin-bottom:10px; }
+.crisis-box.ok{ border-left-color:var(--green); background:#eef2e2; }
+.crisis-h{ font-family:'Oswald',sans-serif; font-weight:600; font-size:13px; letter-spacing:.5px; color:var(--red); }
+.crisis-item{ font-family:'Oswald',sans-serif; font-size:12px; font-weight:600; }
+
+/* targetes d'indicador clicables */
+.pais-card{ background:var(--panelHi); border:1px solid var(--line); border-radius:6px; padding:11px 12px; }
+.pais-card.clickable{ cursor:pointer; transition:box-shadow .15s, transform .1s; }
+.pais-card.clickable:hover{ box-shadow:0 2px 8px rgba(60,48,28,.16); }
+.pais-card.open{ box-shadow:inset 0 0 0 1.5px var(--lineDk); }
+.pais-label{ display:flex; justify-content:space-between; align-items:center; font-family:'Oswald',sans-serif; font-size:11.5px; letter-spacing:1px; text-transform:uppercase; color:var(--inksoft); }
+.pais-caret{ color:var(--lineDk); font-size:11px; }
+.pais-val{ font-family:var(--display); font-weight:700; font-size:30px; line-height:1.1; margin:2px 0 4px; }
+.pais-suf{ font-size:15px; margin-left:1px; }
+.pais-meta{ display:flex; align-items:center; justify-content:space-between; gap:6px; }
+.sev-tag{ font-family:'Oswald',sans-serif; font-size:9.5px; letter-spacing:.6px; text-transform:uppercase; color:#fff; padding:2px 7px; border-radius:10px; }
+.pais-delta{ font-family:'Oswald',sans-serif; font-size:12px; }
+.ind-charthead{ font-family:'Oswald',sans-serif; font-size:11px; letter-spacing:.8px; text-transform:uppercase; color:var(--inksoft); margin-bottom:4px; }
+
+/* oferta i resultat de gabinet a la investidura */
+.cab-offer{ font-size:12.5px; line-height:1.5; text-align:center; background:#f3ecd6; border:1px solid var(--line); border-radius:5px; padding:8px 10px; margin:4px 0 10px; }
+.cab-offer.has{ border-color:var(--gold); background:#f6efd8; }
+.cab-offer-dots{ display:inline-flex; gap:3px; vertical-align:middle; margin:0 3px; }
+.cab-offer-dots .cab-dot{ width:14px; height:14px; }
+.cab-result{ background:var(--panel); border:1px solid var(--line); border-radius:5px; padding:10px 12px; margin:8px 0; }
+.cab-result-h{ font-family:'Oswald',sans-serif; font-size:11px; letter-spacing:.8px; text-transform:uppercase; color:var(--inksoft); margin-bottom:8px; text-align:center; }
+.cab-gain{ margin-top:9px; text-align:center; font-family:'Oswald',sans-serif; font-size:13px; color:var(--green); background:#eef2e2; border-radius:4px; padding:6px; }
 .palmares{ display:flex; gap:10px; }
 .palm{ flex:1; background:var(--panel); border:1px solid var(--line); border-radius:4px; padding:12px; display:flex; flex-direction:column; align-items:center; }
 .palm span{ font-size:11px; color:var(--inksoft); font-family:'Oswald',sans-serif; letter-spacing:.5px; }
